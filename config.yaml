@@ -1,0 +1,151 @@
+# ==============================================================================
+# OCPM Predictive Process Monitoring Benchmark — Configuration
+# Single source of truth for paths, seeds, debug_mode, CV splits, SHAP-RFE, and models.
+# ==============================================================================
+
+random_seed: 42
+
+# When true: limits cases/events for fast smoke runs, sets XGBRegressor(n_estimators=10),
+# and sets epochs=2 for LSTM and GNN.
+debug_mode: false
+
+debug:
+  max_cases: 20
+  max_events_per_case: 100
+  xgb_n_estimators: 10
+  lstm_epochs: 2
+  gnn_epochs: 2
+
+paths:
+  raw_data_dir: "data/raw"
+  # Set to a specific filename inside raw_data_dir, or null to auto-detect
+  # the first .jsonocel / .xmlocel / .sqlite / .csv file.
+  raw_ocel_file: null
+  preprocessed_dir: "data/preprocessed"
+  feature_storage: "data/preprocessed/feature_storage.pkl"
+  case_index: "data/preprocessed/case_index.parquet"
+  entanglement_scores: "data/preprocessed/entanglement_scores.parquet"
+  results_dir: "data/results"
+  test_predictions: "data/results/test_predictions.parquet"
+  selected_features_per_fold: "data/results/selected_features_per_fold.json"
+  matrix1_global_mae: "data/results/matrix1_global_mae.csv"
+  matrix2_regime_mae: "data/results/matrix2_regime_mae.csv"
+
+identifiers:
+  case_id: "Case_ID"
+  event_id: "Event_ID"
+
+target:
+  column: "y_true"
+  # Remaining Time (P3) unit: "seconds", "minutes", "hours", or "days"
+  unit: "hours"
+
+ocpa:
+  # Process execution extraction method: "connected_components" or "leading_type"
+  execution_extraction: "connected_components"
+  leading_type: null
+  # Target object type for O3 (Previous Target-Object Count) and P7 (Pooling Time).
+  # Auto-inferred from sorted object types if null.
+  target_object_type: null
+  # Numeric event attribute for D3/D1. Auto-inferred if null.
+  event_value_attribute: null
+  # Optional event start timestamp column for P9 (Service Time) and P10 (Waiting Time).
+  start_timestamp_column: null
+  workers: 1
+
+features:
+  # Tier 1: 0-Hop Node-Local (R_0(e) = {e})
+  # Includes C5 (Current Activity via ocpa EVENT_ACTIVITY), D3, P9, P2.
+  tier_1:
+    columns:
+      - "D3_current_event_attr"
+      - "P9_service_time"
+      - "P2_elapsed_time"
+    prefixes:
+      - "C5_activity_"
+
+  # Tier 2: Adams et al. (2022) Baseline
+  # Includes C2 (Preceding Activities 1-hop preset), D1, P2, O3.
+  tier_2:
+    columns:
+      - "D1_avg_prev_event_attr"
+      - "P2_elapsed_time"
+      - "O3_prev_target_obj_count"
+    prefixes:
+      - "C2_preceding_act_"
+
+  # Tier 3: Full OCEL Graph Context (pruned per fold via nested SHAP-RFE)
+  # Includes all Tier 2 + Tier 1 features plus P5, P7, P8, P10, P11, P12, O2, O5, C3, and extras.
+  tier_3:
+    columns:
+      - "D3_current_event_attr"
+      - "P9_service_time"
+      - "D1_avg_prev_event_attr"
+      - "P2_elapsed_time"
+      - "O3_prev_target_obj_count"
+      - "P5_synchronization_time"
+      - "P7_pooling_time"
+      - "P8_lagging_time"
+      - "P10_waiting_time"
+      - "P11_flow_time"
+      - "P12_sojourn_time"
+      - "O2_prev_object_count"
+      - "O5_event_object_count"
+    prefixes:
+      - "C5_activity_"
+      - "C2_preceding_act_"
+      - "C3_prev_act_count_"
+      - "O_type_count_"
+      - "ocpa_extra_"
+
+cv:
+  n_splits: 5
+  # Inner split on the 16 outer Train Feature_Graphs -> 12 Sub-Train / 4 Sub-Val
+  inner_test_size: 0.25
+
+shap_rfe:
+  collinearity_threshold: 0.85
+  drop_fraction: 0.10
+  min_drop_count: 1
+  patience: 2
+  min_features: 1
+
+models:
+  xgboost:
+    n_estimators: 300
+    max_depth: 6
+    learning_rate: 0.05
+    subsample: 0.8
+    colsample_bytree: 0.8
+    objective: "reg:squarederror"
+    n_jobs: -1
+    early_stopping_rounds: 20
+
+  lstm:
+    hidden_dim: 64
+    num_layers: 2
+    dropout: 0.2
+    window_size: 20
+    batch_size: 64
+    learning_rate: 0.001
+    epochs: 50
+    patience: 5
+
+  gnn:
+    architecture: "sage"
+    hidden_dim: 64
+    num_layers: 2
+    dropout: 0.2
+    batch_size: 4
+    learning_rate: 0.001
+    epochs: 50
+    patience: 5
+
+entanglement:
+  # Metric normalization across cases before averaging: "minmax" or "zscore"
+  normalization: "minmax"
+  num_regimes: 3
+  regime_labels:
+    - "Regime_1_Low"
+    - "Regime_2_Medium"
+    - "Regime_3_High"
