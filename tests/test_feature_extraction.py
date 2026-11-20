@@ -14,6 +14,7 @@ import pickle
 from datetime import datetime, timedelta
 from typing import Any
 
+import networkx as nx
 import numpy as np
 import ocpa.algo.predictive_monitoring.sequential as pm_seq
 import ocpa.algo.predictive_monitoring.tabular as pm_tab
@@ -21,7 +22,11 @@ import pandas as pd
 import pytest
 
 from src import load_config, resolve_tier_columns
-from src.entanglement_metrics import compute_entanglement_scores
+from src.entanglement_metrics import (
+    compute_entanglement_scores,
+    compute_raw_structural_metrics_table,
+    compute_structural_metrics,
+)
 from src.feature_extraction import (
     build_ocel_from_dataframe,
     extract_feature_storage,
@@ -226,13 +231,56 @@ def test_debug_mode_caps_cases_and_events(base_config: dict[str, Any]) -> None:
     validate_feature_storage(fs, case_index, cfg)
 
 
+def test_structural_metrics_exact_formulas_and_validation() -> None:
+    """Verify exact B(G), R(G), D(G), M(G) formulas and input validation errors."""
+    # Diamond DAG: 0 -> 1, 0 -> 2, 1 -> 3, 2 -> 3 (n=4, m=4, m_u=4, c=1)
+    # indeg: {0:0, 1:1, 2:1, 3:2} -> in_excess = 1
+    # outdeg: {0:2, 1:1, 2:1, 3:0} -> out_excess = 1
+    # B(G) = (1 + 1) / 4 = 0.5
+    # R(G) = (4 - 4 + 1) / 4 = 0.25
+    # D(G) = 4 / (4 * 3) = 1/3
+    # M(G): events 0 and 3 have >1 distinct objects (event 1 has duplicate 'i1' -> only 1 distinct) -> 2/4 = 0.5
+    g = nx.DiGraph([(0, 1), (0, 2), (1, 3), (2, 3)])
+    ev_objs = {
+        0: [("order", "o1"), ("item", "i1"), ("item", "i2")],
+        1: [("item", "i1"), ("item", "i1")],  # duplicate must be deduplicated
+        2: [("item", "i2")],
+        3: [("order", "o1"), ("item", "i1")],
+    }
+    row = compute_structural_metrics(g, ev_objs, graph_id="case_diamond")
+    assert row["graph_id"] == "case_diamond"
+    assert row["is_dag"] is True
+    assert np.isclose(row["branching_join_per_node"], 0.5)
+    assert np.isclose(row["cycle_rank_per_node"], 0.25)
+    assert np.isclose(row["directed_density"], 4.0 / 12.0)
+    assert np.isclose(row["multi_object_frequency"], 0.5)
+
+    # Validation checks
+    with pytest.raises(TypeError):
+        compute_structural_metrics(nx.Graph([(0, 1)]), {0: ["o1"], 1: ["o1"]})
+    with pytest.raises(ValueError):
+        compute_structural_metrics(nx.DiGraph([(0, 0)]), {0: ["o1"]})
+    with pytest.raises(ValueError):
+        compute_structural_metrics(nx.DiGraph(), {})
+    with pytest.raises(KeyError):
+        compute_structural_metrics(nx.DiGraph([(0, 1)]), {0: ["o1"]})
+
+
 def test_entanglement_metrics_on_feature_storage(base_config: dict[str, Any]) -> None:
-    """Verify Stage 1b consumes Feature_Storage and exports normalized scores."""
+    """Verify Stage 1b consumes Feature_Storage and exports exact normalized scores."""
     cfg = copy.deepcopy(base_config)
     cfg["debug_mode"] = False
     ocel = _make_minimal_ocel_fixture()
 
     fs, _ = extract_feature_storage(ocel, cfg)
+    raw_df = compute_raw_structural_metrics_table(fs)
+    assert len(raw_df) == 3
+    assert raw_df["is_dag"].all()
+    # Case 0 (diamond convergence with 4 events, 5 edges: 0->1, 0->2, 0->3, 1->3, 2->3)
+    # must have strictly higher raw B(G) and R(G) than linear Case 2 (2 events, 1 edge)
+    assert raw_df["branching_join_per_node"].max() > raw_df["branching_join_per_node"].min()
+    assert raw_df["cycle_rank_per_node"].max() > raw_df["cycle_rank_per_node"].min()
+
     scores_df = compute_entanglement_scores(fs, normalization="minmax")
 
     expected_cols = [
