@@ -38,15 +38,25 @@ identifiers:
 target:
   column: "y_true"
   # Remaining Time (P3) unit: "seconds", "minutes", "hours", or "days"
-  unit: "hours"
+  unit: "minutes"
 
 ocpa:
-  # Process execution extraction method: "connected_components" or "leading_type"
-  execution_extraction: "connected_components"
-  leading_type: null
+  # Restrict imported OCEL to these object types (null keeps all object types).
+  object_types:
+    - "Match"
+    - "Villager"
+    - "Player"
+    - "Session"
+  # Process execution extraction method:
+  #   - "strict_leading_type": disjoint cases by leading_type (no cross-case duplication via parent objects)
+  #   - "leading_type": native ocpa leading-type extraction
+  #   - "connected_components": native ocpa connected-components extraction
+  execution_extraction: "strict_leading_type"
+  leading_type: "Session"
+  # Optional parent object type used to group CV folds (prevents same-Match opponent leakage).
+  cv_group_object_type: "Match"
   # Target object type for O3 (Previous Target-Object Count) and P7 (Pooling Time).
-  # Auto-inferred from sorted object types if null.
-  target_object_type: null
+  target_object_type: "Villager"
   # Numeric event attribute for D3/D1. Auto-inferred if null.
   event_value_attribute: null
   # Optional event start timestamp column for P9 (Service Time) and P10 (Waiting Time).

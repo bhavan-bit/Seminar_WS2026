@@ -185,7 +185,34 @@ def build_ocel_from_dataframe(df: pd.DataFrame, parameters: dict[str, Any]) -> O
     return OCEL(table_log, obj_log, event_graph, parameters)
 
 
-def _load_sqlite_ocel_to_ocpa(filepath: Path, parameters: dict[str, Any]) -> OCEL:
+def _resolve_object_type_subset(
+    available_types: list[str],
+    configured_types: list[str] | None,
+) -> list[str]:
+    """Resolve configured object types against available OCEL types (case-insensitive)."""
+    if not configured_types:
+        return sorted(available_types)
+    lookup = {ot.lower(): ot for ot in available_types}
+    resolved: list[str] = []
+    missing: list[str] = []
+    for req in configured_types:
+        matched = lookup.get(str(req).strip().lower())
+        if matched is None:
+            missing.append(str(req))
+        elif matched not in resolved:
+            resolved.append(matched)
+    if missing:
+        raise ValueError(
+            f"Configured object_types {missing} not found in OCEL object types {sorted(available_types)}."
+        )
+    return resolved
+
+
+def _load_sqlite_ocel_to_ocpa(
+    filepath: Path,
+    parameters: dict[str, Any],
+    allowed_object_types: list[str] | None = None,
+) -> OCEL:
     """Parse an OCEL 2.0 SQLite database into a native ``ocpa`` ``OCEL`` object."""
     conn = sqlite3.connect(str(filepath))
     try:
@@ -237,8 +264,12 @@ def _load_sqlite_ocel_to_ocpa(filepath: Path, parameters: dict[str, Any]) -> OCE
         if "ocel_time" not in events_df.columns:
             raise ValueError("OCEL 2.0 SQLite event tables missing 'ocel_time' column.")
 
-        obj_type_lookup = dict(zip(objects_df["ocel_id"], objects_df["ocel_type"]))
-        object_types = sorted(objects_df["ocel_type"].dropna().unique().tolist())
+        all_object_types = sorted(objects_df["ocel_type"].dropna().unique().tolist())
+        object_types = _resolve_object_type_subset(all_object_types, allowed_object_types)
+        allowed_set = set(object_types)
+
+        filtered_objects = objects_df[objects_df["ocel_type"].isin(allowed_set)]
+        obj_type_lookup = dict(zip(filtered_objects["ocel_id"], filtered_objects["ocel_type"]))
 
         e2o_map: dict[Any, dict[str, list[str]]] = {}
         for ev_id, obj_id in zip(e2o_df["ocel_event_id"], e2o_df["ocel_object_id"]):
@@ -278,9 +309,82 @@ def _load_sqlite_ocel_to_ocpa(filepath: Path, parameters: dict[str, Any]) -> OCE
             "sep": ",",
         }
         table_params.update(parameters)
+        LOGGER.info(
+            "Loaded SQLite OCEL: %d events, filtered object_types=%s (from %d total types).",
+            len(base_df),
+            object_types,
+            len(all_object_types),
+        )
         return build_ocel_from_dataframe(base_df, table_params)
     finally:
         conn.close()
+
+
+def _apply_strict_leading_type_executions(ocel: OCEL, leading_type: str) -> OCEL:
+    """Partition events strictly by ``leading_type`` without cross-case duplication.
+
+    Each distinct object of ``leading_type`` forms one process execution containing
+    exclusively the events directly linked to that leading object. All configured
+    object types remain attached to those events for ``ocpa`` feature extraction
+    and entanglement calculation, while parent objects shared across cases (e.g.,
+    ``Match`` shared by two ``Session``s) do NOT pull opponent events into a case.
+
+    Args:
+        ocel: Imported ``ocpa`` ``OCEL`` object.
+        leading_type: Object type name defining the case notion (e.g., ``"Session"``).
+
+    Returns:
+        The ``OCEL`` instance with strict per-object process executions assigned.
+    """
+    resolved = _resolve_object_type_subset(list(ocel.object_types), [leading_type])[0]
+    log_df = ocel.log.log
+
+    case_events_by_obj: dict[str, list[Any]] = {}
+    case_objs_by_obj: dict[str, set[tuple[str, str]]] = {}
+
+    for row in log_df.itertuples(index=False):
+        eid = getattr(row, "event_id")
+        lead_objs = getattr(row, resolved)
+        if not lead_objs:
+            continue
+        row_all_objs = [
+            (ot, str(oid))
+            for ot in ocel.object_types
+            for oid in getattr(row, ot)
+        ]
+        for lead_oid in lead_objs:
+            key = str(lead_oid)
+            case_events_by_obj.setdefault(key, []).append(eid)
+            case_objs_by_obj.setdefault(key, set()).update(row_all_objs)
+
+    if not case_events_by_obj:
+        raise ValueError(
+            f"No events associated with leading_type='{resolved}' were found in OCEL."
+        )
+
+    sorted_case_keys = sorted(case_events_by_obj.keys())
+    executions: list[list[Any]] = []
+    exec_objects: list[list[tuple[str, str]]] = []
+    exec_mappings: dict[Any, list[int]] = {}
+
+    for case_idx, case_key in enumerate(sorted_case_keys):
+        eids = case_events_by_obj[case_key]
+        executions.append(eids)
+        exec_objects.append(sorted(case_objs_by_obj[case_key]))
+        for eid in eids:
+            exec_mappings.setdefault(eid, []).append(case_idx)
+
+    ocel._process_executions = executions
+    ocel._process_execution_objects = exec_objects
+    ocel._process_execution_mappings = exec_mappings
+    ocel.parameters["strict_case_object_ids"] = sorted_case_keys
+    LOGGER.info(
+        "Constructed %d strict '%s' process executions (%d total event memberships).",
+        len(executions),
+        resolved,
+        sum(len(e) for e in executions),
+    )
+    return ocel
 
 
 def load_ocel(filepath: str | Path, config: dict[str, Any]) -> OCEL:
@@ -298,28 +402,44 @@ def load_ocel(filepath: str | Path, config: dict[str, Any]) -> OCEL:
         raise FileNotFoundError(f"OCEL input file does not exist: {path}")
 
     ocpa_cfg = config.get("ocpa", {})
-    exec_method = ocpa_cfg.get("execution_extraction", "connected_components")
+    exec_method = str(ocpa_cfg.get("execution_extraction", "connected_components"))
+    allowed_object_types = ocpa_cfg.get("object_types")
+    leading_type = ocpa_cfg.get("leading_type")
+
     parameters: dict[str, Any] = {
         "execution_extraction": LEAD_TYPE if exec_method == "leading_type" else CONN_COMP,
     }
-    if exec_method == "leading_type" and ocpa_cfg.get("leading_type"):
-        parameters["leading_type"] = ocpa_cfg["leading_type"]
+    if exec_method == "leading_type" and leading_type:
+        parameters["leading_type"] = leading_type
 
     ext = path.suffix.lower()
     LOGGER.info("Importing OCEL from %s (format=%s, extraction=%s)", path, ext, exec_method)
 
     if ext == ".jsonocel":
-        return ocel_import.apply(str(path), variant=ocel_import.OCEL_JSON, parameters=parameters)
-    if ext == ".xmlocel":
-        return ocel_import.apply(str(path), variant=ocel_import.OCEL_XML, parameters=parameters)
-    if ext == ".csv":
-        return csv_import.apply(str(path), parameters=parameters)
-    if ext == ".sqlite":
-        return _load_sqlite_ocel_to_ocpa(path, parameters)
+        ocel = ocel_import.apply(str(path), variant=ocel_import.OCEL_JSON, parameters=parameters)
+    elif ext == ".xmlocel":
+        ocel = ocel_import.apply(str(path), variant=ocel_import.OCEL_XML, parameters=parameters)
+    elif ext == ".csv":
+        ocel = csv_import.apply(str(path), parameters=parameters)
+    elif ext == ".sqlite":
+        ocel = _load_sqlite_ocel_to_ocpa(
+            path,
+            parameters=parameters,
+            allowed_object_types=allowed_object_types,
+        )
+    else:
+        raise ValueError(
+            f"Unsupported OCEL extension '{ext}'. Supported: {SUPPORTED_RAW_EXTENSIONS}"
+        )
 
-    raise ValueError(
-        f"Unsupported OCEL extension '{ext}'. Supported: {SUPPORTED_RAW_EXTENSIONS}"
-    )
+    if exec_method == "strict_leading_type":
+        if not leading_type:
+            raise ValueError(
+                "ocpa.leading_type must be set when execution_extraction='strict_leading_type'."
+            )
+        ocel = _apply_strict_leading_type_executions(ocel, leading_type=str(leading_type))
+
+    return ocel
 
 
 def _apply_debug_caps(
@@ -360,11 +480,16 @@ def _apply_debug_caps(
         len(kept_eids),
     )
 
+    capped_params = dict(ocel.parameters)
+    if "strict_case_object_ids" in capped_params:
+        orig_oids = capped_params["strict_case_object_ids"]
+        capped_params["strict_case_object_ids"] = [orig_oids[i] for i in selected_case_indices]
+
     filtered_df = log_df[log_df["event_id"].isin(kept_eids)].copy().reset_index(drop=True)
-    new_table = Table(filtered_df, parameters=ocel.parameters)
+    new_table = Table(filtered_df, parameters=capped_params)
     sub_eog = ocel.graph.eog.subgraph(kept_eids).copy()
     new_graph = EventGraph(sub_eog)
-    capped_ocel = OCEL(new_table, ocel.obj, new_graph, ocel.parameters)
+    capped_ocel = OCEL(new_table, ocel.obj, new_graph, capped_params)
     capped_ocel._process_executions = capped_executions
     capped_ocel._process_execution_mappings = capped_mappings
     capped_ocel._process_execution_objects = capped_objects
@@ -566,6 +691,12 @@ def extract_feature_storage(
     # Sort Feature_Graphs deterministically by pexec_id and canonicalize node attributes
     log_df = ocel.log.log
     ts_lookup = dict(zip(log_df["event_id"], log_df["event_timestamp"]))
+    cv_group_ot = config.get("ocpa", {}).get("cv_group_object_type")
+    if cv_group_ot:
+        resolved_cv_ot = _resolve_object_type_subset(list(ocel.object_types), [str(cv_group_ot)])[0]
+    else:
+        resolved_cv_ot = None
+    strict_case_oids: list[str] | None = ocel.parameters.get("strict_case_object_ids")
 
     canonical_feature_keys: list[str] = [
         spec_to_key[spec] for spec in feature_specs if spec_to_key[spec] != target_col
@@ -604,6 +735,28 @@ def extract_feature_storage(
         fg._edges = causal_edges
         fg._edge_mapping = {(e.source, e.target): e for e in causal_edges}
 
+        # Attach optional CV group metadata (e.g., Match ID) directly on Feature_Graph
+        cv_group_id: str | None = None
+        if resolved_cv_ot is not None:
+            group_oids = sorted(
+                {
+                    str(oid)
+                    for node in ordered_nodes
+                    for (ot, oid) in (node.objects or [])
+                    if str(ot) == resolved_cv_ot
+                }
+            )
+            if group_oids:
+                cv_group_id = group_oids[0]
+                fg.add_attribute("cv_group_id", cv_group_id)
+
+        case_obj_id = (
+            strict_case_oids[int(fg.pexec_id)]
+            if strict_case_oids and int(fg.pexec_id) < len(strict_case_oids)
+            else str(fg.pexec_id)
+        )
+        fg.add_attribute("case_object_id", case_obj_id)
+
         for node in ordered_nodes:
             raw_attrs = dict(node.attributes)
             clean_attrs: dict[str, float] = {}
@@ -641,14 +794,17 @@ def extract_feature_storage(
 
             node._attributes = clean_attrs
 
-        case_index_rows.append(
-            {
-                "Graph_Index": int(graph_idx),
-                case_col: int(fg.pexec_id),
-                "Num_Events": int(len(fg.nodes)),
-                "Num_Edges": int(len(fg.edges)),
-            }
-        )
+        case_row: dict[str, Any] = {
+            "Graph_Index": int(graph_idx),
+            case_col: int(fg.pexec_id),
+            "Num_Events": int(len(fg.nodes)),
+            "Num_Edges": int(len(fg.edges)),
+        }
+        if strict_case_oids is not None:
+            case_row["Case_Object_ID"] = case_obj_id
+        if cv_group_id is not None:
+            case_row["CV_Group_ID"] = cv_group_id
+        case_index_rows.append(case_row)
 
     feature_storage.feature_graphs = sorted_graphs
     feature_storage.event_features = list(canonical_feature_keys)

@@ -136,8 +136,14 @@ def _make_minimal_ocel_fixture() -> Any:
 
 @pytest.fixture()
 def base_config() -> dict[str, Any]:
-    """Load repository config.yaml."""
-    return load_config("config.yaml")
+    """Load repository config.yaml adapted for the inline order/item test fixture."""
+    cfg = load_config("config.yaml")
+    cfg["ocpa"]["object_types"] = ["order", "item"]
+    cfg["ocpa"]["execution_extraction"] = "connected_components"
+    cfg["ocpa"]["leading_type"] = None
+    cfg["ocpa"]["cv_group_object_type"] = None
+    cfg["ocpa"]["target_object_type"] = "item"
+    return cfg
 
 
 def test_feature_storage_extraction_schema_and_ocpa_compatibility(

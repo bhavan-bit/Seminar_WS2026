@@ -129,3 +129,4 @@ pytest -v
 ```
 
 All tests verify Stage 1 `Feature_Storage` schema/alignment, fold-scoped normalization without leakage, validation-only SHAP-RFE stopping behavior, Stage 2 isolation from entanglement metrics, and Stage 3 evaluation matrix computation.
+

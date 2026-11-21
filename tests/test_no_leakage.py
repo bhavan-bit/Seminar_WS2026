@@ -34,6 +34,7 @@ from src.evaluation import (
     build_matrix2_regime_mae,
     compute_case_normalized_mae,
     compute_event_level_mae,
+    split_matrix2_by_tier,
 )
 from src.feature_extraction import build_ocel_from_dataframe, extract_feature_storage
 from src.ocpa_encoding import (
@@ -106,6 +107,11 @@ def _make_minimal_20case_feature_storage(seed: int = 42) -> tuple[Any, dict[str,
         "sep": ",",
     }
     cfg = copy.deepcopy(load_config("config.yaml"))
+    cfg["ocpa"]["object_types"] = ["order", "item"]
+    cfg["ocpa"]["execution_extraction"] = "connected_components"
+    cfg["ocpa"]["leading_type"] = None
+    cfg["ocpa"]["cv_group_object_type"] = None
+    cfg["ocpa"]["target_object_type"] = "item"
     cfg["debug_mode"] = True
     cfg["debug"]["max_cases"] = 20
     cfg["debug"]["max_events_per_case"] = 20
@@ -147,6 +153,26 @@ def test_zero_case_id_overlap_across_all_cv_splits() -> None:
         seen_test.extend(sorted(te))
 
     assert sorted(seen_test) == list(range(20))
+
+    # Also verify parent-group (Match-level) CV grouping: 10 Matches x 2 Sessions -> 16/4 outer, 12/4 inner
+    match_groups = [f"M{i // 2}" for i in range(20)]
+    grouped_folds = generate_graph_cv_splits(
+        num_graphs=20,
+        n_splits=5,
+        inner_test_size=0.25,
+        random_seed=42,
+        cv_groups=match_groups,
+    )
+    assert len(grouped_folds) == 5
+    for fold in grouped_folds:
+        tr_matches = {match_groups[i] for i in fold["train_idx"]}
+        te_matches = {match_groups[i] for i in fold["test_idx"]}
+        sub_tr_matches = {match_groups[i] for i in fold["sub_train_idx"]}
+        sub_va_matches = {match_groups[i] for i in fold["sub_val_idx"]}
+        assert len(fold["train_idx"]) == 16 and len(fold["test_idx"]) == 4
+        assert len(fold["sub_train_idx"]) == 12 and len(fold["sub_val_idx"]) == 4
+        assert tr_matches.isdisjoint(te_matches)
+        assert sub_tr_matches.isdisjoint(sub_va_matches)
 
 
 def test_zero_cross_stage_and_banned_ocpa_split_references() -> None:
@@ -309,10 +335,28 @@ def test_full_5fold_cv_and_stage3_evaluation_reproducibility() -> None:
     assert m2.columns.tolist() == [
         "Metric",
         "Regime",
+        "Tier",
         "Num_Cases",
         "Num_Events",
-        *OOF_PREDICTION_COLUMNS,
+        "XGBoost",
+        "LSTM",
+        "GNN",
     ]
-    assert len(m2) == 6
-    assert int(m2[m2["Metric"] == "Event_Level_MAE"]["Num_Cases"].sum()) == 20
-    assert not m2[OOF_PREDICTION_COLUMNS].isna().any().any()
+    assert len(m2) == 18
+    ev_t1 = m2[(m2["Metric"] == "Event_Level_MAE") & (m2["Tier"] == "Tier 1")]
+    assert int(ev_t1["Num_Cases"].sum()) == 20
+    assert not m2[["XGBoost", "LSTM", "GNN"]].isna().any().any()
+
+    per_tier = split_matrix2_by_tier(m2)
+    assert set(per_tier.keys()) == {"Tier 1", "Tier 2", "Tier 3"}
+    for tier_df in per_tier.values():
+        assert tier_df.columns.tolist() == [
+            "Metric",
+            "Regime",
+            "Num_Cases",
+            "Num_Events",
+            "XGBoost",
+            "LSTM",
+            "GNN",
+        ]
+        assert len(tier_df) == 6

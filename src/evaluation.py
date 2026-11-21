@@ -188,11 +188,11 @@ def build_matrix2_regime_mae(
     num_regimes: int = 3,
     regime_labels: list[str] | None = None,
 ) -> pd.DataFrame:
-    """Build Part 2 Structural Entanglement Regime 3x9 MAE matrix.
+    """Build Part 2 Structural Entanglement Regime MAE matrix in Part 1 table style.
 
     Left-joins quantile-bucketed case entanglement regimes onto OOF predictions
     by ``Case_ID`` and computes both Event-Level MAE and Case-Normalized MAE
-    across all 9 model-tier prediction columns per regime.
+    per ``(Regime, Tier)`` with columns ``[XGBoost, LSTM, GNN]``.
 
     Args:
         oof_df: Combined Out-of-Fold predictions DataFrame.
@@ -204,7 +204,7 @@ def build_matrix2_regime_mae(
 
     Returns:
         DataFrame with columns
-        ``[Metric, Regime, Num_Cases, Num_Events, Pred_XGB_T1, ..., Pred_GNN_T3]``.
+        ``[Metric, Regime, Tier, Num_Cases, Num_Events, XGBoost, LSTM, GNN]``.
     """
     labels = regime_labels or ["Regime_1_Low", "Regime_2_Medium", "Regime_3_High"]
     bucketed = assign_entanglement_regimes(
@@ -230,27 +230,74 @@ def build_matrix2_regime_mae(
     for metric_name in ("Event_Level_MAE", "Case_Normalized_MAE"):
         for regime in labels:
             sub = merged[merged["Regime"] == regime]
-            row: dict[str, Any] = {
-                "Metric": metric_name,
-                "Regime": regime,
-                "Num_Cases": int(sub[case_col].nunique()),
-                "Num_Events": int(len(sub)),
-            }
-            for pred_col in PREDICTION_COLUMNS:
-                if metric_name == "Event_Level_MAE":
-                    row[pred_col] = compute_event_level_mae(sub[target_col], sub[pred_col])
-                else:
-                    row[pred_col] = compute_case_normalized_mae(
-                        sub, case_col=case_col, target_col=target_col, pred_col=pred_col
-                    )
-            rows.append(row)
+            num_cases = int(sub[case_col].nunique())
+            num_events = int(len(sub))
+            for tier_label, tier_code in TIER_MAP:
+                row: dict[str, Any] = {
+                    "Metric": metric_name,
+                    "Regime": regime,
+                    "Tier": tier_label,
+                    "Num_Cases": num_cases,
+                    "Num_Events": num_events,
+                }
+                for model_label, model_code in MODEL_MAP:
+                    pred_col = f"Pred_{model_code}_{tier_code}"
+                    if metric_name == "Event_Level_MAE":
+                        row[model_label] = compute_event_level_mae(
+                            sub[target_col], sub[pred_col]
+                        )
+                    else:
+                        row[model_label] = compute_case_normalized_mae(
+                            sub,
+                            case_col=case_col,
+                            target_col=target_col,
+                            pred_col=pred_col,
+                        )
+                rows.append(row)
 
-    ordered_cols = ["Metric", "Regime", "Num_Cases", "Num_Events", *PREDICTION_COLUMNS]
+    ordered_cols = [
+        "Metric",
+        "Regime",
+        "Tier",
+        "Num_Cases",
+        "Num_Events",
+        "XGBoost",
+        "LSTM",
+        "GNN",
+    ]
     return pd.DataFrame(rows)[ordered_cols]
+
+
+def split_matrix2_by_tier(matrix2_df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """Split the Part 2 regime table into three 3x3 tables, one per feature tier.
+
+    Each returned DataFrame has columns
+    ``[Metric, Regime, Num_Cases, Num_Events, XGBoost, LSTM, GNN]``
+    with 3 regime rows per metric (``Event_Level_MAE`` and ``Case_Normalized_MAE``).
+
+    Args:
+        matrix2_df: Combined Part 2 DataFrame returned by ``build_matrix2_regime_mae``.
+
+    Returns:
+        Dictionary mapping ``"Tier 1"``, ``"Tier 2"``, ``"Tier 3"`` to their
+        respective 3x3 regime-by-model DataFrames.
+    """
+    keep_cols = ["Metric", "Regime", "Num_Cases", "Num_Events", "XGBoost", "LSTM", "GNN"]
+    per_tier: dict[str, pd.DataFrame] = {}
+    for tier_label, _tier_code in TIER_MAP:
+        sub = matrix2_df[matrix2_df["Tier"] == tier_label][keep_cols].reset_index(drop=True)
+        per_tier[tier_label] = sub
+    return per_tier
 
 
 def run_evaluation(config_path: str | Path = "config.yaml") -> tuple[pd.DataFrame, pd.DataFrame]:
     """Run Stage 3 evaluation end-to-end and export Matrix 1 and Matrix 2 CSVs.
+
+    Exports:
+        - ``matrix1_global_mae.csv`` (Part 1 global 3x3 matrix)
+        - ``matrix2_regime_mae.csv`` (Part 2 combined regime x tier matrix)
+        - ``matrix2_regime_mae_tier1.csv``, ``matrix2_regime_mae_tier2.csv``,
+          ``matrix2_regime_mae_tier3.csv`` (three separate 3x3 Regime x Model tables)
 
     Args:
         config_path: Path to ``config.yaml``.
@@ -298,14 +345,20 @@ def run_evaluation(config_path: str | Path = "config.yaml") -> tuple[pd.DataFram
         num_regimes=num_regimes,
         regime_labels=regime_labels,
     )
+    matrix2_per_tier = split_matrix2_by_tier(matrix2_df)
 
     m1_out.parent.mkdir(parents=True, exist_ok=True)
     m2_out.parent.mkdir(parents=True, exist_ok=True)
     matrix1_df.to_csv(m1_out, index=False)
     matrix2_df.to_csv(m2_out, index=False)
 
+    for idx, (tier_label, tier_df) in enumerate(matrix2_per_tier.items(), start=1):
+        tier_path = m2_out.with_name(f"{m2_out.stem}_tier{idx}{m2_out.suffix}")
+        tier_df.to_csv(tier_path, index=False)
+        LOGGER.info("Saved Part 2 %s 3x3 MAE matrix to %s", tier_label, tier_path)
+
     LOGGER.info("Saved Part 1 Global 3x3 MAE matrix to %s", m1_out)
-    LOGGER.info("Saved Part 2 Regime 3x9 MAE matrix to %s", m2_out)
+    LOGGER.info("Saved Part 2 combined Regime MAE matrix to %s", m2_out)
     return matrix1_df, matrix2_df
 
 

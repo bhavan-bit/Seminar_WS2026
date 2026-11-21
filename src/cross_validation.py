@@ -111,22 +111,80 @@ def generate_graph_cv_splits(
     n_splits: int = 5,
     inner_test_size: float = 0.25,
     random_seed: int = 42,
+    cv_groups: list[Any] | None = None,
 ) -> list[dict[str, np.ndarray]]:
     """Generate outer ``KFold`` and inner ``ShuffleSplit`` graph index splits.
+
+    When ``cv_groups`` is provided (e.g., ``Match`` IDs linking paired player
+    ``Session``s), both the outer 5-fold split and inner Sub-Train/Sub-Val split
+    operate strictly at the unique-group level so paired cases from the same
+    group never split across Train/Test or Sub-Train/Sub-Val.
 
     Args:
         num_graphs: Total number of ``Feature_Graph`` objects (e.g., 20).
         n_splits: Number of outer folds (default 5).
-        inner_test_size: Fraction of outer train graphs allocated to Sub-Val (default 0.25).
+        inner_test_size: Fraction of outer train graphs/groups allocated to Sub-Val.
         random_seed: Random seed for outer ``KFold`` and inner ``ShuffleSplit``.
+        cv_groups: Optional sequence of length ``num_graphs`` giving the parent
+            CV group ID (e.g., Match ID) per ``Feature_Graph``.
 
     Returns:
         List of dicts per fold containing ``fold_id``, ``train_idx``, ``test_idx``,
         ``sub_train_idx``, and ``sub_val_idx``.
     """
+    folds: list[dict[str, np.ndarray]] = []
+
+    if cv_groups is not None and len(cv_groups) == num_graphs and len(set(cv_groups)) >= n_splits:
+        unique_groups = np.array(sorted(set(cv_groups)), dtype=object)
+        group_to_indices: dict[Any, list[int]] = {}
+        for idx, grp in enumerate(cv_groups):
+            group_to_indices.setdefault(grp, []).append(idx)
+
+        outer_cv = KFold(n_splits=n_splits, shuffle=True, random_state=random_seed)
+        for fold_id, (tr_g_idx, te_g_idx) in enumerate(outer_cv.split(unique_groups)):
+            tr_groups = unique_groups[tr_g_idx]
+            te_groups = unique_groups[te_g_idx]
+
+            inner_splitter = ShuffleSplit(
+                n_splits=1,
+                test_size=inner_test_size,
+                random_state=random_seed,
+            )
+            sub_tr_g_rel, sub_va_g_rel = next(inner_splitter.split(tr_groups))
+            sub_tr_groups = tr_groups[sub_tr_g_rel]
+            sub_va_groups = tr_groups[sub_va_g_rel]
+
+            if set(tr_groups.tolist()) & set(te_groups.tolist()):
+                raise AssertionError("Outer CV group overlap detected.")
+            if set(sub_tr_groups.tolist()) & set(sub_va_groups.tolist()):
+                raise AssertionError("Inner CV group overlap detected.")
+
+            train_idx = np.array(
+                sorted(i for g in tr_groups for i in group_to_indices[g]), dtype=np.int64
+            )
+            test_idx = np.array(
+                sorted(i for g in te_groups for i in group_to_indices[g]), dtype=np.int64
+            )
+            sub_train_idx = np.array(
+                sorted(i for g in sub_tr_groups for i in group_to_indices[g]), dtype=np.int64
+            )
+            sub_val_idx = np.array(
+                sorted(i for g in sub_va_groups for i in group_to_indices[g]), dtype=np.int64
+            )
+
+            folds.append(
+                {
+                    "fold_id": np.int64(fold_id),
+                    "train_idx": train_idx,
+                    "test_idx": test_idx,
+                    "sub_train_idx": sub_train_idx,
+                    "sub_val_idx": sub_val_idx,
+                }
+            )
+        return folds
+
     all_indices = np.arange(num_graphs, dtype=np.int64)
     outer_cv = KFold(n_splits=n_splits, shuffle=True, random_state=random_seed)
-    folds: list[dict[str, np.ndarray]] = []
 
     for fold_id, (train_idx, test_idx) in enumerate(outer_cv.split(all_indices)):
         inner_splitter = ShuffleSplit(
@@ -196,11 +254,25 @@ def run_cross_validation_in_memory(
 
     num_graphs = len(feature_storage.feature_graphs)
     total_input_events = sum(len(g.nodes) for g in feature_storage.feature_graphs)
+
+    raw_cv_groups = [
+        g.attributes.get("cv_group_id") for g in feature_storage.feature_graphs
+    ]
+    cv_groups = raw_cv_groups if all(v is not None for v in raw_cv_groups) else None
+    if cv_groups is not None:
+        LOGGER.info(
+            "Grouping %d-fold CV strictly by parent CV group (%d unique groups across %d cases).",
+            n_splits,
+            len(set(cv_groups)),
+            num_graphs,
+        )
+
     folds = generate_graph_cv_splits(
         num_graphs=num_graphs,
         n_splits=n_splits,
         inner_test_size=inner_test_size,
         random_seed=seed,
+        cv_groups=cv_groups,
     )
 
     oof_frames: list[pd.DataFrame] = []
@@ -215,6 +287,17 @@ def run_cross_validation_in_memory(
 
         _assert_disjoint_cases(train_fs_raw, test_fs_raw, "Train", "Test")
         _assert_disjoint_cases(sub_train_fs_raw, sub_val_fs_raw, "Sub-Train", "Sub-Val")
+        if cv_groups is not None:
+            tr_grp_set = {g.attributes.get("cv_group_id") for g in train_fs_raw.feature_graphs}
+            te_grp_set = {g.attributes.get("cv_group_id") for g in test_fs_raw.feature_graphs}
+            sub_tr_grp_set = {g.attributes.get("cv_group_id") for g in sub_train_fs_raw.feature_graphs}
+            sub_va_grp_set = {g.attributes.get("cv_group_id") for g in sub_val_fs_raw.feature_graphs}
+            if tr_grp_set & te_grp_set:
+                raise AssertionError(f"Parent CV group leakage between Train and Test: {tr_grp_set & te_grp_set}")
+            if sub_tr_grp_set & sub_va_grp_set:
+                raise AssertionError(
+                    f"Parent CV group leakage between Sub-Train and Sub-Val: {sub_tr_grp_set & sub_va_grp_set}"
+                )
 
         LOGGER.info(
             "=== Fold %d/%d | Train=%d cases | Sub-Train=%d cases | Sub-Val=%d cases | Test=%d cases ===",
@@ -266,6 +349,24 @@ def run_cross_validation_in_memory(
             "sub_train_cases": get_case_ids(sub_train_fs_raw),
             "sub_val_cases": get_case_ids(sub_val_fs_raw),
             "test_cases": get_case_ids(test_fs_raw),
+            **(
+                {
+                    "train_cv_groups": sorted(
+                        {str(g.attributes.get("cv_group_id")) for g in train_fs_raw.feature_graphs}
+                    ),
+                    "sub_train_cv_groups": sorted(
+                        {str(g.attributes.get("cv_group_id")) for g in sub_train_fs_raw.feature_graphs}
+                    ),
+                    "sub_val_cv_groups": sorted(
+                        {str(g.attributes.get("cv_group_id")) for g in sub_val_fs_raw.feature_graphs}
+                    ),
+                    "test_cv_groups": sorted(
+                        {str(g.attributes.get("cv_group_id")) for g in test_fs_raw.feature_graphs}
+                    ),
+                }
+                if cv_groups is not None
+                else {}
+            ),
             **rfe_result.to_log_dict(),
         }
 
