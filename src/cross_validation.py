@@ -20,6 +20,7 @@ import argparse
 import json
 import logging
 import pickle
+import time
 from pathlib import Path
 from typing import Any
 
@@ -219,6 +220,7 @@ def _export_stage2_diagnostics(
     oof_df: pd.DataFrame,
     selected_features_log: dict[str, Any],
     training_history_rows: list[dict[str, Any]],
+    runtime_rows: list[dict[str, Any]],
     val_shap_frames: dict[int, pd.DataFrame],
     case_col: str,
     target_col: str,
@@ -394,6 +396,35 @@ def _export_stage2_diagnostics(
         case_rows.append(row)
     pd.DataFrame(case_rows).to_csv(diagnostics_dir / "per_case_mae.csv", index=False)
 
+    # 7. Per-fold & aggregated model runtimes (Encode / Train / Predict / SHAP-RFE)
+    if runtime_rows:
+        rt_df = pd.DataFrame(runtime_rows)
+        rt_df.to_csv(diagnostics_dir / "model_runtimes_per_fold.csv", index=False)
+
+        rt_summary = (
+            rt_df.groupby(["Tier", "Model"], as_index=False, sort=False)
+            .agg(
+                Mean_Num_Features=("Num_Features", "mean"),
+                Mean_Epochs=("Epochs_Run", "mean"),
+                Mean_Encode_Sec=("Encode_Seconds", "mean"),
+                Mean_Train_Sec=("Train_Seconds", "mean"),
+                Mean_Predict_Sec=("Predict_Seconds", "mean"),
+                Mean_Total_Sec=("Total_Seconds", "mean"),
+                Std_Total_Sec=("Total_Seconds", "std"),
+                Total_5Fold_Sec=("Total_Seconds", "sum"),
+                Total_SHAP_RFE_Sec=("SHAP_RFE_Seconds", "sum"),
+            )
+        )
+        rt_summary["Total_5Fold_With_SHAP_RFE_Sec"] = (
+            rt_summary["Total_5Fold_Sec"] + rt_summary["Total_SHAP_RFE_Sec"]
+        )
+        tier_order = {"Tier 1": 1, "Tier 2": 2, "Tier 3": 3}
+        model_order = {"XGBoost": 1, "LSTM": 2, "GNN": 3}
+        rt_summary["_t"] = rt_summary["Tier"].map(tier_order)
+        rt_summary["_m"] = rt_summary["Model"].map(model_order)
+        rt_summary = rt_summary.sort_values(["_t", "_m"]).drop(columns=["_t", "_m"]).reset_index(drop=True)
+        rt_summary.to_csv(diagnostics_dir / "model_runtimes_summary.csv", index=False)
+
     LOGGER.info("Saved Stage 2 intermediate diagnostics & validation SHAP artifacts to %s", diagnostics_dir)
 
 
@@ -462,6 +493,7 @@ def run_cross_validation_in_memory(
     oof_frames: list[pd.DataFrame] = []
     selected_features_log: dict[str, Any] = {}
     training_history_rows: list[dict[str, Any]] = []
+    runtime_rows: list[dict[str, Any]] = []
     val_shap_frames: dict[int, pd.DataFrame] = {}
 
     for fold in folds:
@@ -521,6 +553,7 @@ def run_cross_validation_in_memory(
             event_col=event_col,
         )
 
+        t_rfe_start = time.perf_counter()
         rfe_result = run_shap_rfe(
             X_sub_train=X_sub_tr_t3,
             y_sub_train=y_sub_tr_t3,
@@ -529,6 +562,7 @@ def run_cross_validation_in_memory(
             config=config,
             random_seed=seed + fold_id * 100,
         )
+        fold_shap_rfe_sec = time.perf_counter() - t_rfe_start
         t3_selected_keys = rfe_result.best_features
         if rfe_result.best_val_shap_values is not None:
             val_shap_df = pd.concat(
@@ -545,6 +579,7 @@ def run_cross_validation_in_memory(
             "sub_train_cases": get_case_ids(sub_train_fs_raw),
             "sub_val_cases": get_case_ids(sub_val_fs_raw),
             "test_cases": get_case_ids(test_fs_raw),
+            "shap_rfe_seconds": round(fold_shap_rfe_sec, 4),
             **(
                 {
                     "train_cv_groups": sorted(
@@ -597,10 +632,14 @@ def run_cross_validation_in_memory(
             "T3": t3_selected_keys,
         }
 
+        tier_display = {"T1": "Tier 1", "T2": "Tier 2", "T3": "Tier 3"}
         for tier_idx, (tier_code, active_keys) in enumerate(active_tier_map.items()):
             tier_seed = seed + fold_id * 100 + tier_idx * 10
+            tier_label = tier_display[tier_code]
+            shap_sec = fold_shap_rfe_sec if tier_code == "T3" else 0.0
 
             # 1. XGBoost (ocpa tabular encoding on 16 outer Train graphs)
+            t0 = time.perf_counter()
             X_tr_tab, y_tr_tab, _ = encode_tabular(
                 train_fs_outer_scaled,
                 feature_keys=active_keys,
@@ -615,14 +654,37 @@ def run_cross_validation_in_memory(
                 case_col=case_col,
                 event_col=event_col,
             )
+            t_enc = time.perf_counter() - t0
+
             xgb_model = TabularXGBModel(config=config, random_seed=tier_seed)
+            t0 = time.perf_counter()
             xgb_model.fit(X_tr_tab, y_tr_tab)
+            t_train = time.perf_counter() - t0
+
+            t0 = time.perf_counter()
             xgb_preds = xgb_model.predict(X_te_tab)
+            t_pred = time.perf_counter() - t0
+
             fold_preds[f"Pred_XGB_{tier_code}"] = _align_predictions_to_base(
                 base_test_meta, te_tab_meta, xgb_preds, case_col, event_col
             )
+            runtime_rows.append(
+                {
+                    "Fold_ID": fold_id,
+                    "Tier": tier_label,
+                    "Model": "XGBoost",
+                    "Num_Features": len(active_keys),
+                    "Epochs_Run": float("nan"),
+                    "Encode_Seconds": t_enc,
+                    "Train_Seconds": t_train,
+                    "Predict_Seconds": t_pred,
+                    "Total_Seconds": t_enc + t_train + t_pred,
+                    "SHAP_RFE_Seconds": shap_sec,
+                }
+            )
 
             # 2. LSTM (ocpa sequential encoding on 12 Sub-Train / 4 Sub-Val graphs)
+            t0 = time.perf_counter()
             X_sub_tr_seq, y_sub_tr_seq, _ = encode_sequential(
                 sub_train_fs_scaled,
                 feature_keys=active_keys,
@@ -647,23 +709,46 @@ def run_cross_validation_in_memory(
                 case_col=case_col,
                 event_col=event_col,
             )
+            t_enc = time.perf_counter() - t0
+
             lstm_model = SequenceLSTMModel(config=config, random_seed=tier_seed)
+            t0 = time.perf_counter()
             lstm_model.fit(
                 X_sub_tr_seq,
                 y_sub_tr_seq,
                 X_val=X_sub_va_seq,
                 y_val=y_sub_va_seq,
             )
+            t_train = time.perf_counter() - t0
             for h_row in lstm_model.training_history:
                 training_history_rows.append(
                     {"Fold_ID": fold_id, "Tier": tier_code, "Model": "LSTM", **h_row}
                 )
+
+            t0 = time.perf_counter()
             lstm_preds = lstm_model.predict(X_te_seq)
+            t_pred = time.perf_counter() - t0
+
             fold_preds[f"Pred_LSTM_{tier_code}"] = _align_predictions_to_base(
                 base_test_meta, te_seq_meta, lstm_preds, case_col, event_col
             )
+            runtime_rows.append(
+                {
+                    "Fold_ID": fold_id,
+                    "Tier": tier_label,
+                    "Model": "LSTM",
+                    "Num_Features": len(active_keys),
+                    "Epochs_Run": len(lstm_model.training_history),
+                    "Encode_Seconds": t_enc,
+                    "Train_Seconds": t_train,
+                    "Predict_Seconds": t_pred,
+                    "Total_Seconds": t_enc + t_train + t_pred,
+                    "SHAP_RFE_Seconds": shap_sec,
+                }
+            )
 
             # 3. GNN (PyG graph encoding on 12 Sub-Train / 4 Sub-Val graphs)
+            t0 = time.perf_counter()
             tr_pyg, _ = encode_pyg_graphs(
                 sub_train_fs_scaled,
                 feature_keys=active_keys,
@@ -685,15 +770,37 @@ def run_cross_validation_in_memory(
                 case_col=case_col,
                 event_col=event_col,
             )
+            t_enc = time.perf_counter() - t0
+
             gnn_model = GraphGNNModel(config=config, random_seed=tier_seed)
+            t0 = time.perf_counter()
             gnn_model.fit(tr_pyg, X_val=va_pyg)
+            t_train = time.perf_counter() - t0
             for h_row in gnn_model.training_history:
                 training_history_rows.append(
                     {"Fold_ID": fold_id, "Tier": tier_code, "Model": "GNN", **h_row}
                 )
+
+            t0 = time.perf_counter()
             gnn_preds = gnn_model.predict(te_pyg)
+            t_pred = time.perf_counter() - t0
+
             fold_preds[f"Pred_GNN_{tier_code}"] = _align_predictions_to_base(
                 base_test_meta, te_pyg_meta, gnn_preds, case_col, event_col
+            )
+            runtime_rows.append(
+                {
+                    "Fold_ID": fold_id,
+                    "Tier": tier_label,
+                    "Model": "GNN",
+                    "Num_Features": len(active_keys),
+                    "Epochs_Run": len(gnn_model.training_history),
+                    "Encode_Seconds": t_enc,
+                    "Train_Seconds": t_train,
+                    "Predict_Seconds": t_pred,
+                    "Total_Seconds": t_enc + t_train + t_pred,
+                    "SHAP_RFE_Seconds": shap_sec,
+                }
             )
 
         oof_frames.append(pd.DataFrame(fold_preds))
@@ -713,6 +820,7 @@ def run_cross_validation_in_memory(
             oof_df=oof_df,
             selected_features_log=selected_features_log,
             training_history_rows=training_history_rows,
+            runtime_rows=runtime_rows,
             val_shap_frames=val_shap_frames,
             case_col=case_col,
             target_col=target_col,

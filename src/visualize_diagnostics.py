@@ -421,6 +421,112 @@ def plot_collinearity_drops(diag_dir: Path, plots_dir: Path, top_k: int = 20) ->
     return _save_fig(fig, plots_dir / "08_collinearity_drops.png")
 
 
+def plot_model_runtimes(
+    results_dir: Path,
+    diag_dir: Path,
+    plots_dir: Path,
+    unit: str,
+) -> Path | None:
+    """Plot total 5-fold runtime breakdown and MAE-vs-Runtime efficiency scatter."""
+    rt_path = diag_dir / "model_runtimes_summary.csv"
+    if not rt_path.exists():
+        return None
+    rt = pd.read_csv(rt_path)
+    if rt.empty:
+        return None
+
+    m1_path = results_dir / "matrix1_global_mae.csv"
+    has_mae = m1_path.exists()
+
+    fig, axes = plt.subplots(1, 2 if has_mae else 1, figsize=(15.0 if has_mae else 9.0, 5.2))
+    ax_bar = axes[0] if has_mae else axes
+
+    # Left: Stacked horizontal bar chart of 5-fold runtime components per (Tier, Model)
+    rt_plot = rt.copy()
+    rt_plot["Label"] = [f"{t} — {m}" for t, m in zip(rt_plot["Tier"], rt_plot["Model"])]
+    rt_plot = rt_plot.iloc[::-1].reset_index(drop=True)
+
+    n_folds = 5.0
+    enc_5f = rt_plot["Mean_Encode_Sec"].to_numpy(dtype=float) * n_folds
+    trn_5f = rt_plot["Mean_Train_Sec"].to_numpy(dtype=float) * n_folds
+    prd_5f = rt_plot["Mean_Predict_Sec"].to_numpy(dtype=float) * n_folds
+    y_pos = np.arange(len(rt_plot))
+
+    ax_bar.barh(y_pos, enc_5f, label="Encode (5-fold)", color="#9ecae1")
+    ax_bar.barh(y_pos, trn_5f, left=enc_5f, label="Train (5-fold)", color="#3182bd")
+    ax_bar.barh(y_pos, prd_5f, left=enc_5f + trn_5f, label="Predict (5-fold)", color="#08519c")
+
+    totals = enc_5f + trn_5f + prd_5f
+    max_t = float(np.max(totals)) if len(totals) else 1.0
+    ax_bar.set_xlim(0.0, max(max_t * 1.42, 0.1))
+    for i, total in enumerate(totals):
+        rfe_extra = float(rt_plot.loc[i, "Total_SHAP_RFE_Sec"])
+        label_txt = f"{total:.2f}s" if rfe_extra <= 0.0 else f"{total:.2f}s (+{rfe_extra:.2f}s RFE)"
+        ax_bar.text(total + max_t * 0.02, i, label_txt, va="center", fontsize=8.2, color="#222222")
+
+    ax_bar.set_yticks(y_pos)
+    ax_bar.set_yticklabels(rt_plot["Label"], fontsize=9)
+    ax_bar.set_xlabel("Total 5-Fold Wall-Clock Runtime (seconds)")
+    ax_bar.set_title("5-Fold Model Runtime Breakdown (Encode / Train / Predict)", fontweight="bold")
+    ax_bar.legend(loc="lower right", frameon=True, fontsize=8.5)
+
+    # Right: Accuracy (Event-Level MAE) vs. Runtime (Pareto view: bottom-left is best)
+    if has_mae:
+        ax_sc = axes[1]
+        m1 = pd.read_csv(m1_path)
+        ev = m1[m1["Metric"] == "Event_Level_MAE"].melt(
+            id_vars=["Tier"],
+            value_vars=["XGBoost", "LSTM", "GNN"],
+            var_name="Model",
+            value_name="Event_Level_MAE",
+        )
+        merged = rt.merge(ev, on=["Tier", "Model"], how="inner")
+
+        model_colors = {"XGBoost": "#1f77b4", "LSTM": "#ff7f0e", "GNN": "#2ca02c"}
+        tier_markers = {"Tier 1": "o", "Tier 2": "s", "Tier 3": "^"}
+        tier_offsets = {"Tier 1": (8, 7), "Tier 2": (8, -11), "Tier 3": (8, -1)}
+
+        for _, row in merged.iterrows():
+            m = str(row["Model"])
+            t = str(row["Tier"])
+            x_val = float(row["Total_5Fold_Sec"])
+            y_val = float(row["Event_Level_MAE"])
+            ax_sc.scatter(
+                [x_val],
+                [y_val],
+                color=model_colors.get(m, "#444444"),
+                marker=tier_markers.get(t, "o"),
+                s=110,
+                edgecolors="black",
+                linewidths=0.7,
+                zorder=4,
+            )
+            ax_sc.annotate(
+                f"{m} {t.replace('Tier ', 'T')}",
+                (x_val, y_val),
+                textcoords="offset points",
+                xytext=tier_offsets.get(t, (7, 4)),
+                fontsize=8.2,
+            )
+
+        ax_sc.margins(x=0.16, y=0.14)
+
+        handles = [
+            plt.Line2D([0], [0], marker="o", color="w", markerfacecolor=col, markersize=8, label=name)
+            for name, col in model_colors.items()
+        ] + [
+            plt.Line2D([0], [0], marker=mk, color="#555555", linestyle="None", markersize=7, label=t)
+            for t, mk in tier_markers.items()
+        ]
+        ax_sc.legend(handles=handles, ncol=2, fontsize=8, loc="best", frameon=True)
+        ax_sc.set_xlabel("Total 5-Fold Model Runtime (seconds) — Lower is Faster →")
+        ax_sc.set_ylabel(f"Event-Level MAE ({unit}) — Lower is Better")
+        ax_sc.set_title("Cost-Accuracy Trade-Off (Bottom-Left = Best)", fontweight="bold")
+
+    fig.tight_layout()
+    return _save_fig(fig, plots_dir / "09_model_runtimes.png")
+
+
 def _df_to_html_table(df: pd.DataFrame, max_rows: int = 30) -> str:
     """Render a pandas DataFrame into a clean styled HTML table."""
     clipped = df.head(max_rows).copy()
@@ -449,6 +555,13 @@ def build_html_report(
         sections.append(
             f"<section><h2>Part 1 — Global 3×3 MAE Matrix ({html.escape(unit)})</h2>"
             f"{_df_to_html_table(pd.read_csv(m1_path))}</section>"
+        )
+
+    rt_path = diag_dir / "model_runtimes_summary.csv"
+    if rt_path.exists():
+        sections.append(
+            "<section><h2>Model Runtime Summary (5-Fold Wall-Clock Seconds)</h2>"
+            f"{_df_to_html_table(pd.read_csv(rt_path))}</section>"
         )
 
     stab_path = diag_dir / "shap_feature_stability_summary.csv"
@@ -552,6 +665,7 @@ def generate_all_diagnostic_plots(
         ("fold_case_mae", "Per-Fold & Per-Case Holdout MAE (Tier 3)", plot_fold_and_case_mae(diag_dir, plots_dir, unit)),
         ("entanglement", "Structural Entanglement Regimes & Metrics", plot_entanglement_regimes(diag_dir, plots_dir)),
         ("collinearity", "Collinear Feature Drops on Sub-Train", plot_collinearity_drops(diag_dir, plots_dir)),
+        ("runtimes", "Model Runtime Breakdown & Accuracy-Speed Trade-Off", plot_model_runtimes(results_dir, diag_dir, plots_dir, unit)),
     ]
 
     outputs: dict[str, Path] = {}
