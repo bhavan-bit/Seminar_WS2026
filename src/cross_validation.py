@@ -214,9 +214,193 @@ def generate_graph_cv_splits(
     return folds
 
 
+def _export_stage2_diagnostics(
+    diagnostics_dir: Path,
+    oof_df: pd.DataFrame,
+    selected_features_log: dict[str, Any],
+    training_history_rows: list[dict[str, Any]],
+    val_shap_frames: dict[int, pd.DataFrame],
+    case_col: str,
+    target_col: str,
+    n_splits: int,
+) -> None:
+    """Export intermediate Stage 2 diagnostic tables and validation SHAP matrices."""
+    diagnostics_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Per-fold validation SHAP feature importances & selection status
+    imp_rows: list[dict[str, Any]] = []
+    rfe_trace_rows: list[dict[str, Any]] = []
+    collinear_rows: list[dict[str, Any]] = []
+
+    for fold_key in sorted(selected_features_log.keys()):
+        fold_id = int(fold_key.split("_")[1])
+        info = selected_features_log[fold_key]
+        selected_set = set(info.get("selected_features", []))
+        init_imp: dict[str, float] = info.get("initial_shap_importances", {})
+        best_imp: dict[str, float] = info.get("best_shap_importances", {})
+        dropped_collinear_set = set(info.get("dropped_collinear", []))
+
+        best_rank_map = {
+            feat: rank
+            for rank, (feat, _val) in enumerate(
+                sorted(best_imp.items(), key=lambda kv: (-kv[1], kv[0])), start=1
+            )
+        }
+        all_seen = sorted(set(init_imp.keys()) | set(best_imp.keys()) | dropped_collinear_set)
+        for feat in all_seen:
+            status = (
+                "Dropped_Collinear"
+                if feat in dropped_collinear_set
+                else ("Selected" if feat in selected_set else "Pruned_SHAP_RFE")
+            )
+            imp_rows.append(
+                {
+                    "Fold_ID": fold_id,
+                    "Feature": feat,
+                    "Status": status,
+                    "Selected_In_Best": feat in selected_set,
+                    "Initial_Mean_Abs_SHAP": float(init_imp[feat]) if feat in init_imp else float("nan"),
+                    "Best_Mean_Abs_SHAP": float(best_imp[feat]) if feat in best_imp else float("nan"),
+                    "Rank_In_Best": best_rank_map.get(feat, pd.NA),
+                }
+            )
+
+        for step in info.get("trace", []):
+            dropped_next = step.get("dropped_next", [])
+            rfe_trace_rows.append(
+                {
+                    "Fold_ID": fold_id,
+                    "Iteration": int(step["iteration"]),
+                    "Num_Features": int(step["num_features"]),
+                    "Val_MAE": float(step["val_mae"]),
+                    "Best_Val_MAE": float(step["best_val_mae"]),
+                    "Degradation_Streak": int(step["degradation_streak"]),
+                    "Dropped_Count": len(dropped_next),
+                    "Dropped_Features": ";".join(dropped_next),
+                }
+            )
+
+        for pair in info.get("collinear_drop_pairs", []):
+            collinear_rows.append({"Fold_ID": fold_id, **pair})
+
+    imp_df = pd.DataFrame(imp_rows)
+    if not imp_df.empty:
+        imp_df = imp_df.sort_values(
+            ["Fold_ID", "Selected_In_Best", "Best_Mean_Abs_SHAP", "Initial_Mean_Abs_SHAP"],
+            ascending=[True, False, False, False],
+        )
+        imp_df.to_csv(diagnostics_dir / "shap_feature_importance_per_fold.csv", index=False)
+
+        # 2. Cross-fold SHAP stability summary
+        stability = (
+            imp_df.groupby("Feature", as_index=False)
+            .agg(
+                Selection_Count=("Selected_In_Best", "sum"),
+                Collinear_Drop_Count=("Status", lambda s: int((s == "Dropped_Collinear").sum())),
+                Mean_Best_Abs_SHAP=("Best_Mean_Abs_SHAP", "mean"),
+                Std_Best_Abs_SHAP=("Best_Mean_Abs_SHAP", "std"),
+                Mean_Initial_Abs_SHAP=("Initial_Mean_Abs_SHAP", "mean"),
+            )
+            .assign(Selection_Rate=lambda d: d["Selection_Count"] / float(n_splits))
+            .sort_values(
+                ["Selection_Count", "Mean_Best_Abs_SHAP", "Mean_Initial_Abs_SHAP"],
+                ascending=[False, False, False],
+            )
+        )
+        stability = stability[
+            [
+                "Feature",
+                "Selection_Count",
+                "Selection_Rate",
+                "Collinear_Drop_Count",
+                "Mean_Best_Abs_SHAP",
+                "Std_Best_Abs_SHAP",
+                "Mean_Initial_Abs_SHAP",
+            ]
+        ]
+        stability.to_csv(diagnostics_dir / "shap_feature_stability_summary.csv", index=False)
+
+    pd.DataFrame(rfe_trace_rows).to_csv(diagnostics_dir / "shap_rfe_trace.csv", index=False)
+    pd.DataFrame(collinear_rows).to_csv(diagnostics_dir / "collinear_dropped_pairs.csv", index=False)
+
+    # 3. Event-level out-of-sample validation SHAP matrices per fold
+    for fold_id, shap_df in sorted(val_shap_frames.items()):
+        shap_df.to_parquet(
+            diagnostics_dir / f"shap_values_val_fold_{fold_id}.parquet",
+            index=False,
+        )
+
+    # 4. Per-epoch LSTM & GNN training curves
+    pd.DataFrame(training_history_rows).to_csv(
+        diagnostics_dir / "training_history.csv", index=False
+    )
+
+    # 5. Per-fold holdout Test MAE across all 9 model-tier combinations
+    model_tier_specs = [
+        ("Tier 1", "XGBoost", "Pred_XGB_T1"),
+        ("Tier 2", "XGBoost", "Pred_XGB_T2"),
+        ("Tier 3", "XGBoost", "Pred_XGB_T3"),
+        ("Tier 1", "LSTM", "Pred_LSTM_T1"),
+        ("Tier 2", "LSTM", "Pred_LSTM_T2"),
+        ("Tier 3", "LSTM", "Pred_LSTM_T3"),
+        ("Tier 1", "GNN", "Pred_GNN_T1"),
+        ("Tier 2", "GNN", "Pred_GNN_T2"),
+        ("Tier 3", "GNN", "Pred_GNN_T3"),
+    ]
+    fold_metric_rows: list[dict[str, Any]] = []
+    for fold_id, fgrp in oof_df.groupby("Fold_ID", sort=True):
+        f_info = selected_features_log.get(f"fold_{int(fold_id)}", {})
+        test_groups_str = ";".join(str(x) for x in f_info.get("test_cv_groups", []))
+        test_cases_str = ";".join(str(x) for x in f_info.get("test_cases", []))
+        y_true = fgrp[target_col].to_numpy(dtype=np.float64)
+        for tier_label, model_label, pred_col in model_tier_specs:
+            abs_err = np.abs(y_true - fgrp[pred_col].to_numpy(dtype=np.float64))
+            ev_mae = float(np.mean(abs_err))
+            case_mae = float(
+                pd.DataFrame({case_col: fgrp[case_col].to_numpy(), "ae": abs_err})
+                .groupby(case_col)["ae"]
+                .mean()
+                .mean()
+            )
+            fold_metric_rows.append(
+                {
+                    "Fold_ID": int(fold_id),
+                    "Test_CV_Groups": test_groups_str,
+                    "Test_Cases": test_cases_str,
+                    "Num_Events": int(len(fgrp)),
+                    "Tier": tier_label,
+                    "Model": model_label,
+                    "Event_Level_MAE": ev_mae,
+                    "Case_Normalized_MAE": case_mae,
+                }
+            )
+    pd.DataFrame(fold_metric_rows).to_csv(diagnostics_dir / "fold_metrics.csv", index=False)
+
+    # 6. Per-case MAE across all 20 cases
+    case_rows: list[dict[str, Any]] = []
+    for case_id, cgrp in oof_df.groupby(case_col, sort=True):
+        y_true = cgrp[target_col].to_numpy(dtype=np.float64)
+        row: dict[str, Any] = {
+            case_col: int(case_id),
+            "Fold_ID": int(cgrp["Fold_ID"].iloc[0]),
+            "Num_Events": int(len(cgrp)),
+            "Mean_y_true": float(np.mean(y_true)),
+            "Max_y_true": float(np.max(y_true)),
+        }
+        for pred_col in OOF_PREDICTION_COLUMNS:
+            row[f"{pred_col}_MAE"] = float(
+                np.mean(np.abs(y_true - cgrp[pred_col].to_numpy(dtype=np.float64)))
+            )
+        case_rows.append(row)
+    pd.DataFrame(case_rows).to_csv(diagnostics_dir / "per_case_mae.csv", index=False)
+
+    LOGGER.info("Saved Stage 2 intermediate diagnostics & validation SHAP artifacts to %s", diagnostics_dir)
+
+
 def run_cross_validation_in_memory(
     feature_storage: Feature_Storage,
     config: dict[str, Any],
+    diagnostics_out_dir: str | Path | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Run leak-free 5-fold cross-validation across all 9 model-tier combinations.
 
@@ -277,6 +461,8 @@ def run_cross_validation_in_memory(
 
     oof_frames: list[pd.DataFrame] = []
     selected_features_log: dict[str, Any] = {}
+    training_history_rows: list[dict[str, Any]] = []
+    val_shap_frames: dict[int, pd.DataFrame] = {}
 
     for fold in folds:
         fold_id = int(fold["fold_id"])
@@ -327,7 +513,7 @@ def run_cross_validation_in_memory(
             case_col=case_col,
             event_col=event_col,
         )
-        X_sub_va_t3, y_sub_va_t3, _ = encode_tabular(
+        X_sub_va_t3, y_sub_va_t3, meta_sub_va_t3 = encode_tabular(
             sub_val_fs_scaled,
             feature_keys=tier_keys["T3"],
             target_key=target_col,
@@ -344,6 +530,16 @@ def run_cross_validation_in_memory(
             random_seed=seed + fold_id * 100,
         )
         t3_selected_keys = rfe_result.best_features
+        if rfe_result.best_val_shap_values is not None:
+            val_shap_df = pd.concat(
+                [
+                    meta_sub_va_t3.reset_index(drop=True),
+                    pd.Series(y_sub_va_t3, name=target_col),
+                    rfe_result.best_val_shap_values.reset_index(drop=True),
+                ],
+                axis=1,
+            )
+            val_shap_frames[fold_id] = val_shap_df
         selected_features_log[f"fold_{fold_id}"] = {
             "train_cases": get_case_ids(train_fs_raw),
             "sub_train_cases": get_case_ids(sub_train_fs_raw),
@@ -458,6 +654,10 @@ def run_cross_validation_in_memory(
                 X_val=X_sub_va_seq,
                 y_val=y_sub_va_seq,
             )
+            for h_row in lstm_model.training_history:
+                training_history_rows.append(
+                    {"Fold_ID": fold_id, "Tier": tier_code, "Model": "LSTM", **h_row}
+                )
             lstm_preds = lstm_model.predict(X_te_seq)
             fold_preds[f"Pred_LSTM_{tier_code}"] = _align_predictions_to_base(
                 base_test_meta, te_seq_meta, lstm_preds, case_col, event_col
@@ -487,6 +687,10 @@ def run_cross_validation_in_memory(
             )
             gnn_model = GraphGNNModel(config=config, random_seed=tier_seed)
             gnn_model.fit(tr_pyg, X_val=va_pyg)
+            for h_row in gnn_model.training_history:
+                training_history_rows.append(
+                    {"Fold_ID": fold_id, "Tier": tier_code, "Model": "GNN", **h_row}
+                )
             gnn_preds = gnn_model.predict(te_pyg)
             fold_preds[f"Pred_GNN_{tier_code}"] = _align_predictions_to_base(
                 base_test_meta, te_pyg_meta, gnn_preds, case_col, event_col
@@ -501,6 +705,18 @@ def run_cross_validation_in_memory(
     if len(oof_df) != total_input_events:
         raise AssertionError(
             f"OOF prediction row count ({len(oof_df)}) != input event count ({total_input_events})."
+        )
+
+    if diagnostics_out_dir is not None:
+        _export_stage2_diagnostics(
+            diagnostics_dir=Path(diagnostics_out_dir),
+            oof_df=oof_df,
+            selected_features_log=selected_features_log,
+            training_history_rows=training_history_rows,
+            val_shap_frames=val_shap_frames,
+            case_col=case_col,
+            target_col=target_col,
+            n_splits=n_splits,
         )
 
     LOGGER.info(
@@ -533,6 +749,7 @@ def run_cross_validation(
     fs_path = Path(config["paths"]["feature_storage"])
     preds_out = Path(config["paths"]["test_predictions"])
     sel_out = Path(config["paths"]["selected_features_per_fold"])
+    diag_dir = Path(config["paths"].get("diagnostics_dir", "data/results/diagnostics"))
 
     if not fs_path.exists():
         raise FileNotFoundError(
@@ -545,6 +762,7 @@ def run_cross_validation(
     oof_df, selected_features_log = run_cross_validation_in_memory(
         feature_storage=feature_storage,
         config=config,
+        diagnostics_out_dir=diag_dir,
     )
 
     preds_out.parent.mkdir(parents=True, exist_ok=True)

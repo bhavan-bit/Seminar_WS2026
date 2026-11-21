@@ -110,6 +110,13 @@ def test_shap_values_computed_exclusively_on_sub_val() -> None:
     assert len(recorded_eval_indices) >= 1
     assert len(result.best_features) >= 1
     assert np.isfinite(result.best_val_mae)
+    # Verify rich SHAP importance & validation SHAP matrix exports
+    assert set(result.best_shap_importances.keys()) == set(result.best_features)
+    assert len(result.initial_shap_importances) == result.initial_feature_count - len(result.dropped_collinear)
+    assert len(result.collinear_drop_pairs) == len(result.dropped_collinear)
+    assert result.best_val_shap_values is not None
+    assert list(result.best_val_shap_values.columns) == result.best_features
+    assert set(result.best_val_shap_values.index.tolist()) == val_indices
 
 
 def test_shap_rfe_stopping_criterion_after_two_consecutive_degradations() -> None:

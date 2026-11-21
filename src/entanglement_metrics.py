@@ -321,6 +321,10 @@ def run_entanglement_metrics(config_path: str | Path = "config.yaml") -> pd.Data
     with fs_path.open("rb") as handle:
         feature_storage: Feature_Storage = pickle.load(handle)
 
+    raw_df = compute_raw_structural_metrics_table(
+        feature_storage=feature_storage,
+        case_id_col=case_id_col,
+    )
     scores_df = compute_entanglement_scores(
         feature_storage=feature_storage,
         case_id_col=case_id_col,
@@ -329,12 +333,19 @@ def run_entanglement_metrics(config_path: str | Path = "config.yaml") -> pd.Data
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     scores_df.to_parquet(output_path, index=False)
+
+    # Export full raw + normalized diagnostics CSV for inspection (Stage 1b write-only)
+    diag_df = raw_df.merge(scores_df, on=case_id_col, how="left")
+    diag_path = output_path.parent / "entanglement_raw_diagnostics.csv"
+    diag_df.to_csv(diag_path, index=False)
+
     LOGGER.info(
         "Saved entanglement scores for %d cases to %s (normalization=%s).",
         len(scores_df),
         output_path,
         normalization,
     )
+    LOGGER.info("Saved raw + normalized entanglement diagnostics to %s.", diag_path)
     return scores_df
 
 

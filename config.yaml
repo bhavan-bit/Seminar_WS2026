@@ -26,6 +26,7 @@ paths:
   case_index: "data/preprocessed/case_index.parquet"
   entanglement_scores: "data/preprocessed/entanglement_scores.parquet"
   results_dir: "data/results"
+  diagnostics_dir: "data/results/diagnostics"
   test_predictions: "data/results/test_predictions.parquet"
   selected_features_per_fold: "data/results/selected_features_per_fold.json"
   matrix1_global_mae: "data/results/matrix1_global_mae.csv"

@@ -76,6 +76,7 @@ class SequenceLSTMModel(BaseOCPMModel):
         self.patience = int(lstm_cfg.get("patience", 5))
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._net: _PrefixLSTMNet | None = None
+        self.training_history: list[dict[str, Any]] = []
 
     def fit(
         self,
@@ -136,9 +137,12 @@ class SequenceLSTMModel(BaseOCPMModel):
         best_val_loss = float("inf")
         best_state: dict[str, torch.Tensor] | None = None
         no_improve = 0
+        self.training_history = []
 
         for epoch in range(self.epochs):
             self._net.train()
+            train_abs_err = 0.0
+            train_count = 0
             for batch_x, batch_y in train_loader:
                 batch_x = batch_x.to(self.device)
                 batch_y = batch_y.to(self.device)
@@ -147,7 +151,12 @@ class SequenceLSTMModel(BaseOCPMModel):
                 loss = criterion(preds, batch_y)
                 loss.backward()
                 optimizer.step()
+                train_abs_err += float(torch.abs(preds.detach() - batch_y).sum().item())
+                train_count += int(batch_y.numel())
+            train_mae = train_abs_err / max(train_count, 1)
 
+            val_mae: float | None = None
+            is_best = False
             if val_loader is not None:
                 self._net.eval()
                 val_abs_err = 0.0
@@ -165,15 +174,26 @@ class SequenceLSTMModel(BaseOCPMModel):
                     best_val_loss = val_mae
                     best_state = copy.deepcopy(self._net.state_dict())
                     no_improve = 0
+                    is_best = True
                 else:
                     no_improve += 1
-                    if no_improve >= self.patience:
-                        LOGGER.debug(
-                            "LSTM early stopped at epoch %d (best val MAE=%.6f).",
-                            epoch + 1,
-                            best_val_loss,
-                        )
-                        break
+
+            self.training_history.append(
+                {
+                    "Epoch": epoch + 1,
+                    "Train_MAE": float(train_mae),
+                    "Val_MAE": float(val_mae) if val_mae is not None else float("nan"),
+                    "Is_Best_Epoch": is_best,
+                }
+            )
+
+            if val_loader is not None and no_improve >= self.patience:
+                LOGGER.debug(
+                    "LSTM early stopped at epoch %d (best val MAE=%.6f).",
+                    epoch + 1,
+                    best_val_loss,
+                )
+                break
 
         if best_state is not None:
             self._net.load_state_dict(best_state)

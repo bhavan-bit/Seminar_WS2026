@@ -27,6 +27,7 @@ from typing import Any
 
 import numpy as np
 import ocpa.algo.predictive_monitoring.factory as pm_factory
+import ocpa.algo.predictive_monitoring.tabular as pm_tabular
 import ocpa.objects.log.converter.versions.df_to_ocel as df_to_ocel
 import ocpa.objects.log.importer.csv.factory as csv_import
 import ocpa.objects.log.importer.ocel.factory as ocel_import
@@ -38,7 +39,7 @@ from ocpa.objects.log.variants.graph import EventGraph
 from ocpa.objects.log.variants.table import Table
 from ocpa.util.constants import CONN_COMP, LEAD_TYPE
 
-from src import configure_logging, load_config, set_global_seed
+from src import configure_logging, load_config, resolve_tier_columns, set_global_seed
 
 LOGGER = logging.getLogger(__name__)
 
@@ -877,6 +878,68 @@ def validate_feature_storage(
                 )
 
 
+def export_stage1_diagnostics(
+    feature_storage: Feature_Storage,
+    case_index_df: pd.DataFrame,
+    config: dict[str, Any],
+) -> pd.DataFrame:
+    """Export human-readable Stage 1a diagnostic summaries (write-only; never read by Stage 2).
+
+    Saves ``case_index.csv`` and ``stage1_feature_summary.csv`` under
+    ``config["paths"]["preprocessed_dir"]``.
+    """
+    prep_dir = Path(config["paths"]["preprocessed_dir"])
+    prep_dir.mkdir(parents=True, exist_ok=True)
+    case_index_df.to_csv(prep_dir / "case_index.csv", index=False)
+
+    target_col = config["target"]["column"]
+    raw_table = pm_tabular.construct_table(feature_storage, index_list="all")
+    all_keys = list(feature_storage.event_features)
+
+    t1_set = set(resolve_tier_columns(all_keys, config, "tier_1"))
+    t2_set = set(resolve_tier_columns(all_keys, config, "tier_2"))
+    t3_set = set(resolve_tier_columns(all_keys, config, "tier_3"))
+
+    summary_rows: list[dict[str, Any]] = []
+    for col in [target_col, *all_keys]:
+        vals = pd.to_numeric(raw_table[col], errors="coerce").to_numpy(dtype=np.float64)
+        finite = vals[np.isfinite(vals)]
+        n_total = int(vals.size)
+        n_valid = int(finite.size)
+        n_nan = n_total - n_valid
+        vmin = float(np.min(finite)) if n_valid else float("nan")
+        vmean = float(np.mean(finite)) if n_valid else float("nan")
+        vstd = float(np.std(finite, ddof=0)) if n_valid else float("nan")
+        vmax = float(np.max(finite)) if n_valid else float("nan")
+        summary_rows.append(
+            {
+                "Feature": col,
+                "Role": "Target" if col == target_col else "Feature",
+                "In_Tier_1": col in t1_set,
+                "In_Tier_2": col in t2_set,
+                "In_Tier_3": col in t3_set,
+                "Non_Null_Count": n_valid,
+                "NaN_Count": n_nan,
+                "Min": vmin,
+                "Mean": vmean,
+                "Std": vstd,
+                "Max": vmax,
+                "Is_Constant": bool(n_valid > 0 and vstd == 0.0),
+            }
+        )
+
+    summary_df = pd.DataFrame(summary_rows)
+    summary_path = prep_dir / "stage1_feature_summary.csv"
+    summary_df.to_csv(summary_path, index=False)
+    LOGGER.info(
+        "Saved Stage 1a diagnostics to %s and %s (%d constant features).",
+        prep_dir / "case_index.csv",
+        summary_path,
+        int(summary_df.loc[summary_df["Role"] == "Feature", "Is_Constant"].sum()),
+    )
+    return summary_df
+
+
 def run_feature_extraction(
     config_path: str | Path = "config.yaml",
     debug_override: bool | None = None,
@@ -907,6 +970,7 @@ def run_feature_extraction(
     with fs_out.open("wb") as handle:
         pickle.dump(feature_storage, handle)
     case_index_df.to_parquet(idx_out, index=False)
+    export_stage1_diagnostics(feature_storage, case_index_df, config)
 
     LOGGER.info("Saved unnormalized Feature_Storage to %s", fs_out)
     LOGGER.info("Saved case index metadata to %s", idx_out)

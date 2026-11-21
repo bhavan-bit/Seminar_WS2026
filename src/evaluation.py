@@ -290,7 +290,10 @@ def split_matrix2_by_tier(matrix2_df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     return per_tier
 
 
-def run_evaluation(config_path: str | Path = "config.yaml") -> tuple[pd.DataFrame, pd.DataFrame]:
+def run_evaluation(
+    config_path: str | Path = "config.yaml",
+    generate_plots: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Run Stage 3 evaluation end-to-end and export Matrix 1 and Matrix 2 CSVs.
 
     Exports:
@@ -357,8 +360,45 @@ def run_evaluation(config_path: str | Path = "config.yaml") -> tuple[pd.DataFram
         tier_df.to_csv(tier_path, index=False)
         LOGGER.info("Saved Part 2 %s 3x3 MAE matrix to %s", tier_label, tier_path)
 
+    # Export per-case regime assignment + MAE diagnostic table
+    diag_dir = Path(config["paths"].get("diagnostics_dir", "data/results/diagnostics"))
+    diag_dir.mkdir(parents=True, exist_ok=True)
+    bucketed_cases = assign_entanglement_regimes(
+        entanglement_df=entanglement_df,
+        case_col=case_col,
+        num_regimes=num_regimes,
+        regime_labels=regime_labels,
+    )
+    case_idx_path = Path(config["paths"].get("case_index", ""))
+    if case_idx_path.exists():
+        case_idx_df = pd.read_parquet(case_idx_path)
+        extra_cols = [c for c in case_idx_df.columns if c not in bucketed_cases.columns]
+        if extra_cols:
+            bucketed_cases = bucketed_cases.merge(
+                case_idx_df[[case_col, *extra_cols]], on=case_col, how="left"
+            )
+    per_case_mae_rows: list[dict[str, Any]] = []
+    for cid, grp in oof_df.groupby(case_col, sort=True):
+        yt = grp[target_col].to_numpy(dtype=np.float64)
+        crow: dict[str, Any] = {case_col: int(cid), "Fold_ID": int(grp["Fold_ID"].iloc[0])}
+        for pcol in PREDICTION_COLUMNS:
+            crow[f"{pcol}_MAE"] = float(np.mean(np.abs(yt - grp[pcol].to_numpy(dtype=np.float64))))
+        per_case_mae_rows.append(crow)
+    case_regime_df = bucketed_cases.merge(
+        pd.DataFrame(per_case_mae_rows), on=case_col, how="left"
+    ).sort_values(["Regime", "Avg_Entanglement_Score", case_col])
+    regime_diag_path = diag_dir / "case_regime_assignments.csv"
+    case_regime_df.to_csv(regime_diag_path, index=False)
+    LOGGER.info("Saved per-case regime assignment diagnostics to %s", regime_diag_path)
+
     LOGGER.info("Saved Part 1 Global 3x3 MAE matrix to %s", m1_out)
     LOGGER.info("Saved Part 2 combined Regime MAE matrix to %s", m2_out)
+
+    if generate_plots:
+        from src.visualize_diagnostics import generate_all_diagnostic_plots
+
+        generate_all_diagnostic_plots(config_path=config_path)
+
     return matrix1_df, matrix2_df
 
 
@@ -366,9 +406,14 @@ def main() -> None:
     """CLI entry point for Stage 3 evaluation."""
     parser = argparse.ArgumentParser(description="Stage 3: Global & Regime MAE Evaluation")
     parser.add_argument("--config", default="config.yaml", help="Path to config.yaml")
+    parser.add_argument(
+        "--no-plots",
+        action="store_true",
+        help="Skip generating visual diagnostic plots and HTML report",
+    )
     args = parser.parse_args()
     configure_logging()
-    run_evaluation(config_path=args.config)
+    run_evaluation(config_path=args.config, generate_plots=not args.no_plots)
 
 
 if __name__ == "__main__":
