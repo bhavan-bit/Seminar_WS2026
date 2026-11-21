@@ -18,10 +18,12 @@ Outputs:
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import logging
 import pickle
 import re
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any
 
@@ -547,25 +549,526 @@ def _detect_target_object_type(ocel: OCEL, config: dict[str, Any]) -> str:
     return str(sorted(ocel.object_types)[0])
 
 
+def _extract_feature_storage_fast(
+    ocel: OCEL,
+    config: dict[str, Any],
+    activities: list[str],
+    object_types: list[str],
+    target_ot: str,
+    start_ts_col: str | None,
+    numeric_attrs: list[str],
+    primary_attr: str | None,
+    canonical_feature_keys: list[str],
+    time_divisor: float,
+) -> tuple[Feature_Storage, pd.DataFrame]:
+    """O(N) single-pass prefix-sweep extraction numerically equivalent to native ``ocpa``.
+
+    Produces a native ``ocpa.algo.predictive_monitoring.obj.Feature_Storage`` with
+    exact bit-level parity to ``ocpa.algo.predictive_monitoring.factory.apply(...)``
+    while avoiding ``ocpa``'s O(N^2 * A) pure-Python prefix re-scanning.
+    """
+    case_col = config["identifiers"]["case_id"]
+    target_col = config["target"]["column"]
+
+    log_df = ocel.log.log
+    event_ids_all = log_df["event_id"].tolist()
+    ts_list_all = log_df["event_timestamp"].tolist()
+    act_list_all = log_df["event_activity"].tolist()
+
+    ts_lookup: dict[Any, pd.Timestamp] = dict(zip(event_ids_all, ts_list_all))
+    ts_sec_lookup: dict[Any, float] = {
+        eid: pd.Timestamp(ts).value / 1e9 for eid, ts in ts_lookup.items()
+    }
+    act_lookup: dict[Any, Any] = dict(zip(event_ids_all, act_list_all))
+
+    start_ts_sec_lookup: dict[Any, float] | None = None
+    if start_ts_col is not None:
+        start_ts_sec_lookup = {
+            eid: pd.Timestamp(ts).value / 1e9
+            for eid, ts in zip(event_ids_all, log_df[start_ts_col].tolist())
+        }
+
+    # Per-object-type object lists and combined event_objects per event_id
+    # Use ocel.object_types order to match native ocpa's exact node.objects list order
+    ocel_ot_order = [str(ot) for ot in ocel.object_types]
+    ot_lists: dict[str, dict[Any, list[Any]]] = {
+        ot: dict(zip(event_ids_all, log_df[ot].tolist())) for ot in ocel_ot_order
+    }
+    event_objects_lookup: dict[Any, list[tuple[str, Any]]] = {}
+    event_objects_set_lookup: dict[Any, set[tuple[str, Any]]] = {}
+    for eid in event_ids_all:
+        objs = [(ot, o) for ot in ocel_ot_order for o in ot_lists[ot][eid]]
+        event_objects_lookup[eid] = objs
+        event_objects_set_lookup[eid] = set(objs)
+
+    # Numeric event attribute lookups
+    attr_lookup: dict[str, dict[Any, float]] = {}
+    for attr in numeric_attrs:
+        vals: dict[Any, float] = {}
+        for eid, raw_v in zip(event_ids_all, log_df[attr].tolist()):
+            try:
+                fv = float(raw_v)
+                vals[eid] = fv if np.isfinite(fv) else float("nan")
+            except (TypeError, ValueError):
+                vals[eid] = float("nan")
+        attr_lookup[attr] = vals
+
+    # Pre-index full EOG incoming predecessor activities (matches ocpa preceding_activities)
+    eog = ocel.graph.eog
+    eog_pred_act_counts: dict[Any, Counter[str]] = {}
+    for eid in event_ids_all:
+        cnt: Counter[str] = Counter()
+        for src, _dst in eog.in_edges(eid):
+            src_act = act_lookup.get(src)
+            if src_act is not None and not pd.isna(src_act):
+                cnt[str(src_act)] += 1
+        eog_pred_act_counts[eid] = cnt
+
+    # Precompute activity key strings once
+    act_c5_keys = [(act, f"C5_activity_{_sanitize_name(act)}") for act in activities]
+    act_c2_keys = [(act, f"C2_preceding_act_{_sanitize_name(act)}") for act in activities]
+    act_c3_keys = [(act, f"C3_prev_act_count_{_sanitize_name(act)}") for act in activities]
+    act_to_idx = {act: idx for idx, act in enumerate(activities)}
+    num_acts = len(activities)
+
+    ot_type_count_keys = [(ot, f"O_type_count_{_sanitize_name(ot)}") for ot in object_types]
+    ot_prev_keys = [
+        (
+            ot,
+            "O3_prev_target_obj_count"
+            if ot == target_ot
+            else f"ocpa_extra_prev_type_count_{_sanitize_name(ot)}",
+        )
+        for ot in object_types
+    ]
+    ot_pool_keys = [
+        (
+            ot,
+            "P7_pooling_time"
+            if ot == target_ot
+            else f"ocpa_extra_pooling_time_{_sanitize_name(ot)}",
+        )
+        for ot in object_types
+    ]
+    extra_attrs = numeric_attrs[1:]
+    extra_attr_keys = [
+        (
+            attr,
+            f"ocpa_extra_char_{_sanitize_name(attr)}",
+            f"ocpa_extra_avg_prev_{_sanitize_name(attr)}",
+        )
+        for attr in extra_attrs
+    ]
+
+    process_executions = ocel.process_executions
+    exec_mappings = ocel.process_execution_mappings
+    num_cases = len(process_executions)
+
+    # Check if every event belongs to exactly 1 case (fast path with zero cross-case averaging)
+    all_single_case = all(len(c_list) == 1 for c_list in exec_mappings.values())
+
+    # Precompute per-case timestamp-block prefix metrics & per-case preset timing metrics in O(N)
+    # Structure per case c_id: maps eid -> precomputed scalar/vector values
+    case_ordered_eids: list[list[Any]] = []
+    case_remaining_sec: list[dict[Any, float]] = []
+    case_elapsed_sec: list[dict[Any, float]] = []
+    case_prev_obj_cnt: list[dict[Any, int]] = []
+    case_prev_type_cnt: list[dict[str, dict[Any, int]]] = []
+    case_prev_act_arr: list[dict[Any, np.ndarray]] = []
+    case_avg_prev_attr: list[dict[str, dict[Any, float]]] = []
+    case_preset_timings: list[dict[Any, dict[str, float]]] = []
+
+    for c_id in range(num_cases):
+        raw_eids = list(process_executions[c_id])
+        ordered_eids = sorted(raw_eids, key=lambda eid: (ts_lookup[eid], eid))
+        case_ordered_eids.append(ordered_eids)
+
+        if not ordered_eids:
+            case_remaining_sec.append({})
+            case_elapsed_sec.append({})
+            case_prev_obj_cnt.append({})
+            case_prev_type_cnt.append({ot: {} for ot in object_types})
+            case_prev_act_arr.append({})
+            case_avg_prev_attr.append({attr: {} for attr in numeric_attrs})
+            case_preset_timings.append({})
+            continue
+
+        min_ts_sec = ts_sec_lookup[ordered_eids[0]]
+        max_ts_sec = ts_sec_lookup[ordered_eids[-1]]
+
+        rem_map: dict[Any, float] = {}
+        elap_map: dict[Any, float] = {}
+        prev_obj_map: dict[Any, int] = {}
+        prev_type_map: dict[str, dict[Any, int]] = {ot: {} for ot in object_types}
+        prev_act_map: dict[Any, np.ndarray] = {}
+        avg_attr_map: dict[str, dict[Any, float]] = {attr: {} for attr in numeric_attrs}
+
+        seen_objs: set[tuple[str, Any]] = set()
+        seen_by_ot: dict[str, set[tuple[str, Any]]] = {ot: set() for ot in object_types}
+        running_act_counts = np.zeros(num_acts, dtype=np.int64)
+        running_attr_sum: dict[str, float] = {attr: 0.0 for attr in numeric_attrs}
+        running_attr_cnt: dict[str, int] = {attr: 0 for attr in numeric_attrs}
+
+        # Sweep contiguous equal-timestamp blocks to match ocpa's get_recent_events (ts <= ts_e)
+        n_ev = len(ordered_eids)
+        idx = 0
+        while idx < n_ev:
+            block_ts = ts_lookup[ordered_eids[idx]]
+            block_end = idx + 1
+            while block_end < n_ev and ts_lookup[ordered_eids[block_end]] == block_ts:
+                block_end += 1
+            block_eids = ordered_eids[idx:block_end]
+
+            # Accumulate all events in this equal-timestamp block first
+            for eid in block_eids:
+                objs = event_objects_lookup[eid]
+                seen_objs.update(objs)
+                for ot_o in objs:
+                    seen_by_ot[ot_o[0]].add(ot_o)
+                act_val = act_lookup[eid]
+                if act_val is not None and not pd.isna(act_val):
+                    a_idx = act_to_idx.get(str(act_val))
+                    if a_idx is not None:
+                        running_act_counts[a_idx] += 1
+                for attr in numeric_attrs:
+                    fv = attr_lookup[attr][eid]
+                    if np.isfinite(fv):
+                        running_attr_sum[attr] += fv
+                        running_attr_cnt[attr] += 1
+
+            block_ts_sec = ts_sec_lookup[block_eids[0]]
+            block_elapsed = block_ts_sec - min_ts_sec
+            block_remaining = max_ts_sec - block_ts_sec
+            block_obj_total = len(seen_objs)
+            block_ot_totals = {ot: len(seen_by_ot[ot]) for ot in object_types}
+            block_act_snapshot = running_act_counts.copy()
+            block_attr_means = {
+                attr: (
+                    running_attr_sum[attr] / running_attr_cnt[attr]
+                    if running_attr_cnt[attr] > 0
+                    else float("nan")
+                )
+                for attr in numeric_attrs
+            }
+
+            for eid in block_eids:
+                rem_map[eid] = block_remaining
+                elap_map[eid] = block_elapsed
+                prev_obj_map[eid] = block_obj_total
+                for ot in object_types:
+                    prev_type_map[ot][eid] = block_ot_totals[ot]
+                prev_act_map[eid] = block_act_snapshot
+                for attr in numeric_attrs:
+                    avg_attr_map[attr][eid] = block_attr_means[attr]
+
+            idx = block_end
+
+        case_remaining_sec.append(rem_map)
+        case_elapsed_sec.append(elap_map)
+        case_prev_obj_cnt.append(prev_obj_map)
+        case_prev_type_cnt.append(prev_type_map)
+        case_prev_act_arr.append(prev_act_map)
+        case_avg_prev_attr.append(avg_attr_map)
+
+        # Case-subgraph preset timing features in O(N_c + |E_c|)
+        case_subgraph = eog.subgraph(ordered_eids)
+        preset_map: dict[Any, dict[str, float]] = {}
+        for eid in ordered_eids:
+            preset = [src for (src, _dst) in case_subgraph.in_edges(eid)]
+            if not preset:
+                tdict: dict[str, float] = {
+                    "P5_synchronization_time": 0.0,
+                    "P8_lagging_time": 0.0,
+                    "P10_waiting_time": 0.0,
+                    "P11_flow_time": 0.0,
+                    "P12_sojourn_time": 0.0,
+                }
+                for _ot, pkey in ot_pool_keys:
+                    tdict[pkey] = 0.0
+                preset_map[eid] = tdict
+                continue
+
+            end_ts_secs = [ts_sec_lookup[u] for u in preset]
+            max_end = max(end_ts_secs)
+            min_end = min(end_ts_secs)
+            curr_ts = ts_sec_lookup[eid]
+
+            sojourn = curr_ts - max_end
+            flow = curr_ts - min_end
+            sync = max_end - min_end
+            waiting = (
+                (start_ts_sec_lookup[eid] - max_end)
+                if start_ts_sec_lookup is not None
+                else sojourn
+            )
+
+            ot_maxs: list[float] = []
+            target_ot_ts: list[float] = []
+            tdict = {
+                "P5_synchronization_time": sync,
+                "P10_waiting_time": waiting,
+                "P11_flow_time": flow,
+                "P12_sojourn_time": sojourn,
+            }
+            for ot, pkey in ot_pool_keys:
+                ot_ts = [ts_sec_lookup[u] for u in preset if ot_lists[ot][u]]
+                if ot_ts:
+                    ot_max = max(ot_ts)
+                    ot_maxs.append(ot_max)
+                    tdict[pkey] = ot_max - min(ot_ts)
+                    if ot == target_ot:
+                        target_ot_ts = ot_ts
+                else:
+                    tdict[pkey] = 0.0
+
+            if target_ot_ts and ot_maxs:
+                tdict["P8_lagging_time"] = max(0.0, max(target_ot_ts) - min(ot_maxs))
+            else:
+                tdict["P8_lagging_time"] = 0.0
+
+            preset_map[eid] = tdict
+
+        case_preset_timings.append(preset_map)
+
+    # Assemble native ocpa Feature_Storage & Feature_Graphs matching native structure 1-to-1
+    cv_group_ot = config.get("ocpa", {}).get("cv_group_object_type")
+    resolved_cv_ot = (
+        _resolve_object_type_subset(list(ocel.object_types), [str(cv_group_ot)])[0]
+        if cv_group_ot
+        else None
+    )
+    strict_case_oids: list[str] | None = ocel.parameters.get("strict_case_object_ids")
+
+    feature_storage = Feature_Storage(
+        event_features=list(canonical_feature_keys),
+        execution_features=[],
+        ocel=ocel,
+    )
+    sorted_graphs: list[Feature_Storage.Feature_Graph] = []
+    case_index_rows: list[dict[str, Any]] = []
+
+    for graph_idx, c_id in enumerate(range(num_cases)):
+        ordered_eids = case_ordered_eids[c_id]
+        pos_by_eid = {eid: i for i, eid in enumerate(ordered_eids)}
+        case_subgraph = eog.subgraph(ordered_eids)
+
+        fg = Feature_Storage.Feature_Graph.__new__(Feature_Storage.Feature_Graph)
+        fg._pexec_id = c_id
+        nodes = [
+            Feature_Storage.Feature_Graph.Node(eid, event_objects_lookup[eid], c_id)
+            for eid in ordered_eids
+        ]
+        fg._nodes = nodes
+        fg._node_mapping = {n.event_id: n for n in nodes}
+
+        causal_edges: list[Feature_Storage.Feature_Graph.Edge] = []
+        edge_objects_map: dict[tuple[Any, Any], set[tuple[str, Any]]] = {}
+        for src, dst in case_subgraph.edges:
+            if src in pos_by_eid and dst in pos_by_eid and pos_by_eid[src] < pos_by_eid[dst]:
+                shared = event_objects_set_lookup[src].intersection(event_objects_set_lookup[dst])
+                edge_objects_map[(src, dst)] = shared
+                causal_edges.append(
+                    Feature_Storage.Feature_Graph.Edge(src, dst, objects=shared)
+                )
+        fg._objects = edge_objects_map
+        fg._edges = causal_edges
+        fg._edge_mapping = {(e.source, e.target): e for e in causal_edges}
+        fg._attributes = {}
+
+        cv_group_id: str | None = None
+        if resolved_cv_ot is not None:
+            group_oids = sorted(
+                {
+                    str(oid)
+                    for node in nodes
+                    for (ot, oid) in (node.objects or [])
+                    if str(ot) == resolved_cv_ot
+                }
+            )
+            if group_oids:
+                cv_group_id = group_oids[0]
+                fg.add_attribute("cv_group_id", cv_group_id)
+
+        case_obj_id = (
+            strict_case_oids[c_id]
+            if strict_case_oids and c_id < len(strict_case_oids)
+            else str(c_id)
+        )
+        fg.add_attribute("case_object_id", case_obj_id)
+
+        rem_c = case_remaining_sec[c_id]
+        elap_c = case_elapsed_sec[c_id]
+        prev_obj_c = case_prev_obj_cnt[c_id]
+        prev_type_c = case_prev_type_cnt[c_id]
+        prev_act_c = case_prev_act_arr[c_id]
+        avg_attr_c = case_avg_prev_attr[c_id]
+        preset_c = case_preset_timings[c_id]
+
+        for node in nodes:
+            eid = node.event_id
+            act_val = act_lookup[eid]
+            act_str = None if (act_val is None or pd.isna(act_val)) else str(act_val)
+            pred_cnts = eog_pred_act_counts[eid]
+            cases_for_ev = [c_id] if all_single_case else exec_mappings.get(eid, [c_id])
+            inv_n_cases = 1.0 / len(cases_for_ev)
+
+            attrs: dict[str, float] = {}
+
+            # Target (strictly node.pexec_id, matching ocpa remaining_time)
+            y_val = rem_c[eid] / time_divisor
+            attrs[target_col] = max(0.0, float(y_val)) if np.isfinite(y_val) else 0.0
+
+            # C5: Current Activity
+            for act, k_c5 in act_c5_keys:
+                attrs[k_c5] = 1.0 if act_str == act else 0.0
+
+            # C2: Preceding Activities (from full EOG in-edges)
+            for act, k_c2 in act_c2_keys:
+                attrs[k_c2] = float(pred_cnts.get(act, 0))
+
+            # C3: Previous Activity Counts
+            if len(cases_for_ev) == 1:
+                c0 = cases_for_ev[0]
+                act_vec = prev_act_c[eid] if c0 == c_id else case_prev_act_arr[c0][eid]
+                for a_i, (_act, k_c3) in enumerate(act_c3_keys):
+                    attrs[k_c3] = float(act_vec[a_i])
+            else:
+                summed = np.zeros(num_acts, dtype=np.float64)
+                for cc in cases_for_ev:
+                    summed += case_prev_act_arr[cc][eid]
+                summed *= inv_n_cases
+                for a_i, (_act, k_c3) in enumerate(act_c3_keys):
+                    attrs[k_c3] = float(summed[a_i])
+
+            # P2: Elapsed time & P9: Service time
+            if len(cases_for_ev) == 1:
+                c0 = cases_for_ev[0]
+                elap_s = elap_c[eid] if c0 == c_id else case_elapsed_sec[c0][eid]
+            else:
+                elap_s = sum(case_elapsed_sec[cc][eid] for cc in cases_for_ev) * inv_n_cases
+            attrs["P2_elapsed_time"] = float(elap_s / time_divisor)
+
+            if start_ts_sec_lookup is not None:
+                attrs["P9_service_time"] = float(
+                    (ts_sec_lookup[eid] - start_ts_sec_lookup[eid]) / time_divisor
+                )
+            else:
+                attrs["P9_service_time"] = 0.0
+
+            # Preset timing features: P5, P7, P8, P10, P11, P12, extra pooling
+            if len(cases_for_ev) == 1:
+                c0 = cases_for_ev[0]
+                pmap = preset_c[eid] if c0 == c_id else case_preset_timings[c0][eid]
+                for tkey, tsec in pmap.items():
+                    attrs[tkey] = float(tsec / time_divisor)
+            else:
+                for tkey in preset_c[eid]:
+                    avg_s = (
+                        sum(case_preset_timings[cc][eid][tkey] for cc in cases_for_ev)
+                        * inv_n_cases
+                    )
+                    attrs[tkey] = float(avg_s / time_divisor)
+
+            # Object count features: O5, O2, O_type_count_*, O3, extra prev_type_count
+            attrs["O5_event_object_count"] = float(len(event_objects_lookup[eid]))
+            if len(cases_for_ev) == 1:
+                c0 = cases_for_ev[0]
+                attrs["O2_prev_object_count"] = float(
+                    prev_obj_c[eid] if c0 == c_id else case_prev_obj_cnt[c0][eid]
+                )
+                for ot, k_prev in ot_prev_keys:
+                    attrs[k_prev] = float(
+                        prev_type_c[ot][eid] if c0 == c_id else case_prev_type_cnt[c0][ot][eid]
+                    )
+            else:
+                attrs["O2_prev_object_count"] = float(
+                    sum(case_prev_obj_cnt[cc][eid] for cc in cases_for_ev) * inv_n_cases
+                )
+                for ot, k_prev in ot_prev_keys:
+                    attrs[k_prev] = float(
+                        sum(case_prev_type_cnt[cc][ot][eid] for cc in cases_for_ev) * inv_n_cases
+                    )
+
+            for ot, k_tc in ot_type_count_keys:
+                attrs[k_tc] = float(len(ot_lists[ot][eid]))
+
+            # Event attributes: D3, D1, and any extra numeric attributes
+            if primary_attr is not None:
+                attrs["D3_current_event_attr"] = float(attr_lookup[primary_attr][eid])
+                if len(cases_for_ev) == 1:
+                    c0 = cases_for_ev[0]
+                    attrs["D1_avg_prev_event_attr"] = float(
+                        avg_attr_c[primary_attr][eid]
+                        if c0 == c_id
+                        else case_avg_prev_attr[c0][primary_attr][eid]
+                    )
+                else:
+                    vals = [case_avg_prev_attr[cc][primary_attr][eid] for cc in cases_for_ev]
+                    attrs["D1_avg_prev_event_attr"] = float(sum(vals) * inv_n_cases)
+            else:
+                attrs["D3_current_event_attr"] = 0.0
+                attrs["D1_avg_prev_event_attr"] = 0.0
+
+            for attr, k_ch, k_avg in extra_attr_keys:
+                attrs[k_ch] = float(attr_lookup[attr][eid])
+                if len(cases_for_ev) == 1:
+                    c0 = cases_for_ev[0]
+                    attrs[k_avg] = float(
+                        avg_attr_c[attr][eid] if c0 == c_id else case_avg_prev_attr[c0][attr][eid]
+                    )
+                else:
+                    vals = [case_avg_prev_attr[cc][attr][eid] for cc in cases_for_ev]
+                    attrs[k_avg] = float(sum(vals) * inv_n_cases)
+
+            node._attributes = attrs
+
+        sorted_graphs.append(fg)
+        case_row: dict[str, Any] = {
+            "Graph_Index": int(graph_idx),
+            case_col: int(c_id),
+            "Num_Events": int(len(fg.nodes)),
+            "Num_Edges": int(len(fg.edges)),
+        }
+        if strict_case_oids is not None:
+            case_row["Case_Object_ID"] = case_obj_id
+        if cv_group_id is not None:
+            case_row["CV_Group_ID"] = cv_group_id
+        case_index_rows.append(case_row)
+
+    feature_storage.feature_graphs = sorted_graphs
+    feature_storage.event_features = list(canonical_feature_keys)
+    feature_storage._scaler = None
+    feature_storage._training_indices = None
+    feature_storage._test_indices = None
+
+    case_index_df = pd.DataFrame(case_index_rows)
+    if case_index_df.empty:
+        raise ValueError("Feature extraction produced zero Feature_Graphs.")
+    validate_feature_storage(feature_storage, case_index_df, config)
+    return feature_storage, case_index_df
+
+
 def extract_feature_storage(
     ocel: OCEL,
     config: dict[str, Any],
+    extraction_mode: str | None = None,
 ) -> tuple[Feature_Storage, pd.DataFrame]:
     """Extract an unnormalized ``ocpa`` ``Feature_Storage`` and case index metadata.
 
-    Calls ``ocpa.algo.predictive_monitoring.factory.apply(...)`` once to compute
-    all Tier 1, Tier 2, and Tier 3 features plus ``EVENT_REMAINING_TIME``,
-    converts feature tuple keys to canonical string keys for clean pickling and
-    downstream tier filtering, enforces chronological node order and causal
-    directed edges within every ``Feature_Graph``, and NEVER normalizes or splits.
+    Supports two numerically equivalent engines selectable via
+    ``config["ocpa"]["extraction_mode"]`` or ``extraction_mode``:
+        - ``"fast"`` (default): O(N) single-pass timestamp-block prefix sweep.
+        - ``"native"``: ``ocpa.algo.predictive_monitoring.factory.apply(...)``.
+
+    NEVER normalizes or splits inside Stage 1.
 
     Args:
         ocel: Imported ``ocpa`` ``OCEL`` instance.
         config: Loaded configuration dictionary.
+        extraction_mode: Optional override (``"fast"`` or ``"native"``).
 
     Returns:
-        Tuple of ``(feature_storage, case_index_df)`` where ``case_index_df``
-        has columns ``[Graph_Index, Case_ID, Num_Events, Num_Edges]``.
+        Tuple of ``(feature_storage, case_index_df)``.
     """
     if config.get("debug_mode", False):
         dbg = config.get("debug", {})
@@ -574,6 +1077,14 @@ def extract_feature_storage(
             max_cases=dbg.get("max_cases"),
             max_events_per_case=dbg.get("max_events_per_case"),
         )
+
+    mode = str(
+        extraction_mode
+        if extraction_mode is not None
+        else config.get("ocpa", {}).get("extraction_mode", "fast")
+    ).lower()
+    if mode not in {"fast", "native"}:
+        raise ValueError(f"Unsupported extraction_mode '{mode}'. Choose 'fast' or 'native'.")
 
     case_col = config["identifiers"]["case_id"]
     target_col = config["target"]["column"]
@@ -594,8 +1105,9 @@ def extract_feature_storage(
     primary_attr = numeric_attrs[0] if numeric_attrs else None
 
     LOGGER.info(
-        "Extracting ocpa Feature_Storage for %d cases | %d activities | "
+        "Extracting ocpa Feature_Storage (mode=%s) for %d cases | %d activities | "
         "object_types=%s | target_ot=%s | primary_attr=%s | unit=%s",
+        mode,
         len(ocel.process_executions),
         len(activities),
         object_types,
@@ -682,6 +1194,43 @@ def extract_feature_storage(
             f"ocpa_extra_avg_prev_{sanitized_attr}",
         )
 
+    canonical_feature_keys: list[str] = [
+        spec_to_key[spec] for spec in feature_specs if spec_to_key[spec] != target_col
+    ]
+    for fallback_key in (
+        "P8_lagging_time",
+        "P9_service_time",
+        "P10_waiting_time",
+        "D3_current_event_attr",
+        "D1_avg_prev_event_attr",
+    ):
+        if fallback_key not in canonical_feature_keys:
+            canonical_feature_keys.append(fallback_key)
+
+    t_start = time.perf_counter()
+    if mode == "fast":
+        feature_storage, case_index_df = _extract_feature_storage_fast(
+            ocel=ocel,
+            config=config,
+            activities=activities,
+            object_types=object_types,
+            target_ot=target_ot,
+            start_ts_col=start_ts_col,
+            numeric_attrs=numeric_attrs,
+            primary_attr=primary_attr,
+            canonical_feature_keys=canonical_feature_keys,
+            time_divisor=time_divisor,
+        )
+        elapsed = time.perf_counter() - t_start
+        LOGGER.info(
+            "Extracted unnormalized Feature_Storage (mode=fast) in %.3fs: %d cases, %d events, %d feature keys.",
+            elapsed,
+            len(case_index_df),
+            int(case_index_df["Num_Events"].sum()),
+            len(feature_storage.event_features),
+        )
+        return feature_storage, case_index_df
+
     workers = int(config.get("ocpa", {}).get("workers", 1))
     feature_storage = pm_factory.apply(
         ocel,
@@ -698,19 +1247,6 @@ def extract_feature_storage(
     else:
         resolved_cv_ot = None
     strict_case_oids: list[str] | None = ocel.parameters.get("strict_case_object_ids")
-
-    canonical_feature_keys: list[str] = [
-        spec_to_key[spec] for spec in feature_specs if spec_to_key[spec] != target_col
-    ]
-    for fallback_key in (
-        "P8_lagging_time",
-        "P9_service_time",
-        "P10_waiting_time",
-        "D3_current_event_attr",
-        "D1_avg_prev_event_attr",
-    ):
-        if fallback_key not in canonical_feature_keys:
-            canonical_feature_keys.append(fallback_key)
 
     sorted_graphs = sorted(feature_storage.feature_graphs, key=lambda g: g.pexec_id)
     case_index_rows: list[dict[str, Any]] = []
@@ -819,13 +1355,144 @@ def extract_feature_storage(
         raise ValueError("Feature extraction produced zero Feature_Graphs.")
 
     validate_feature_storage(feature_storage, case_index_df, config)
+    elapsed = time.perf_counter() - t_start
     LOGGER.info(
-        "Extracted unnormalized Feature_Storage: %d cases, %d total events, %d feature keys.",
+        "Extracted unnormalized Feature_Storage (mode=native) in %.3fs: %d cases, %d events, %d feature keys.",
+        elapsed,
         len(case_index_df),
         int(case_index_df["Num_Events"].sum()),
         len(feature_storage.event_features),
     )
     return feature_storage, case_index_df
+
+
+def assert_feature_storages_equivalent(
+    fs_native: Feature_Storage,
+    case_index_native: pd.DataFrame,
+    fs_fast: Feature_Storage,
+    case_index_fast: pd.DataFrame,
+    rtol: float = 1e-12,
+    atol: float = 1e-12,
+) -> dict[str, Any]:
+    """Assert exact structural and numerical equivalence between native and fast extraction.
+
+    Raises:
+        AssertionError: On any mismatch in case index, graph topology, node objects,
+            edge sets, feature keys, NaN masks, or floating-point values beyond tolerance.
+
+    Returns:
+        Summary dictionary with total values compared and maximum absolute difference.
+    """
+    if not case_index_native.equals(case_index_fast):
+        raise AssertionError("case_index DataFrames differ between native and fast extraction.")
+    if fs_native.event_features != fs_fast.event_features:
+        raise AssertionError("event_features ordering/keys differ between native and fast extraction.")
+    if len(fs_native.feature_graphs) != len(fs_fast.feature_graphs):
+        raise AssertionError("Number of Feature_Graphs differs between native and fast extraction.")
+
+    max_abs_diff = 0.0
+    total_values_checked = 0
+    total_nans_matched = 0
+
+    for fg_n, fg_f in zip(fs_native.feature_graphs, fs_fast.feature_graphs):
+        if fg_n.pexec_id != fg_f.pexec_id:
+            raise AssertionError(f"pexec_id mismatch: {fg_n.pexec_id} vs {fg_f.pexec_id}")
+        if fg_n.attributes != fg_f.attributes:
+            raise AssertionError(
+                f"Graph attributes mismatch on Case_ID={fg_n.pexec_id}: {fg_n.attributes} vs {fg_f.attributes}"
+            )
+        if len(fg_n.nodes) != len(fg_f.nodes):
+            raise AssertionError(f"Node count mismatch on Case_ID={fg_n.pexec_id}")
+
+        edges_n = sorted((e.source, e.target, frozenset(e.objects)) for e in fg_n.edges)
+        edges_f = sorted((e.source, e.target, frozenset(e.objects)) for e in fg_f.edges)
+        if edges_n != edges_f:
+            raise AssertionError(f"Edge topology/objects mismatch on Case_ID={fg_n.pexec_id}")
+
+        for node_n, node_f in zip(fg_n.nodes, fg_f.nodes):
+            if node_n.event_id != node_f.event_id:
+                raise AssertionError(
+                    f"Event_ID ordering mismatch on Case_ID={fg_n.pexec_id}: "
+                    f"{node_n.event_id} vs {node_f.event_id}"
+                )
+            if list(node_n.objects) != list(node_f.objects):
+                raise AssertionError(
+                    f"Node objects mismatch on Case_ID={fg_n.pexec_id}, Event_ID={node_n.event_id}"
+                )
+            keys_n = set(node_n.attributes.keys())
+            keys_f = set(node_f.attributes.keys())
+            if keys_n != keys_f:
+                raise AssertionError(
+                    f"Attribute key mismatch on Case_ID={fg_n.pexec_id}, Event_ID={node_n.event_id}: "
+                    f"diff={keys_n ^ keys_f}"
+                )
+            for k in sorted(keys_n):
+                vn = float(node_n.attributes[k])
+                vf = float(node_f.attributes[k])
+                total_values_checked += 1
+                if np.isnan(vn) and np.isnan(vf):
+                    total_nans_matched += 1
+                    continue
+                if np.isnan(vn) != np.isnan(vf):
+                    raise AssertionError(
+                        f"NaN mismatch on Case_ID={fg_n.pexec_id}, Event_ID={node_n.event_id}, "
+                        f"key={k}: native={vn}, fast={vf}"
+                    )
+                diff = abs(vn - vf)
+                if diff > max_abs_diff:
+                    max_abs_diff = diff
+                if not np.isclose(vn, vf, rtol=rtol, atol=atol):
+                    raise AssertionError(
+                        f"Value mismatch on Case_ID={fg_n.pexec_id}, Event_ID={node_n.event_id}, "
+                        f"key={k}: native={vn}, fast={vf}, abs_diff={diff}"
+                    )
+
+    return {
+        "cases_verified": len(fs_native.feature_graphs),
+        "feature_keys_verified": len(fs_native.event_features),
+        "total_values_checked": total_values_checked,
+        "total_nans_matched": total_nans_matched,
+        "max_abs_diff": max_abs_diff,
+    }
+
+
+def verify_native_vs_fast_equivalence(
+    ocel: OCEL,
+    config: dict[str, Any],
+    rtol: float = 1e-12,
+    atol: float = 1e-12,
+) -> dict[str, Any]:
+    """Run both native and fast extractors on ``ocel`` and verify exact equivalence."""
+    t0 = time.perf_counter()
+    fs_native, idx_native = extract_feature_storage(ocel, config, extraction_mode="native")
+    native_sec = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    fs_fast, idx_fast = extract_feature_storage(ocel, config, extraction_mode="fast")
+    fast_sec = time.perf_counter() - t0
+
+    stats = assert_feature_storages_equivalent(
+        fs_native=fs_native,
+        case_index_native=idx_native,
+        fs_fast=fs_fast,
+        case_index_fast=idx_fast,
+        rtol=rtol,
+        atol=atol,
+    )
+    stats["native_seconds"] = round(native_sec, 4)
+    stats["fast_seconds"] = round(fast_sec, 4)
+    stats["speedup"] = round(native_sec / max(fast_sec, 1e-9), 2)
+    LOGGER.info(
+        "EXACT EQUIVALENCE VERIFIED: %d values checked (%d NaNs matched), "
+        "max_abs_diff=%.3e | native=%.3fs vs fast=%.3fs (%.2fx speedup).",
+        stats["total_values_checked"],
+        stats["total_nans_matched"],
+        stats["max_abs_diff"],
+        stats["native_seconds"],
+        stats["fast_seconds"],
+        stats["speedup"],
+    )
+    return stats
 
 
 def validate_feature_storage(
@@ -943,12 +1610,17 @@ def export_stage1_diagnostics(
 def run_feature_extraction(
     config_path: str | Path = "config.yaml",
     debug_override: bool | None = None,
+    extraction_mode: str | None = None,
+    verify_equivalence: bool = False,
 ) -> tuple[Feature_Storage, pd.DataFrame]:
     """Run Stage 1a end-to-end and save ``feature_storage.pkl`` and ``case_index.parquet``.
 
     Args:
         config_path: Path to ``config.yaml``.
         debug_override: Optional boolean override for ``config["debug_mode"]``.
+        extraction_mode: Optional override (``"fast"`` or ``"native"``).
+        verify_equivalence: If ``True``, runs both native and fast extractors and
+            asserts exact equivalence before saving.
 
     Returns:
         Tuple of ``(feature_storage, case_index_df)``.
@@ -960,7 +1632,13 @@ def run_feature_extraction(
 
     raw_path = discover_raw_ocel_path(config)
     ocel = load_ocel(raw_path, config)
-    feature_storage, case_index_df = extract_feature_storage(ocel, config)
+
+    if verify_equivalence:
+        verify_native_vs_fast_equivalence(ocel, config)
+
+    feature_storage, case_index_df = extract_feature_storage(
+        ocel, config, extraction_mode=extraction_mode
+    )
 
     fs_out = Path(config["paths"]["feature_storage"])
     idx_out = Path(config["paths"]["case_index"])
@@ -987,9 +1665,25 @@ def main() -> None:
         default=None,
         help="Override config.yaml to enable debug_mode",
     )
+    parser.add_argument(
+        "--mode",
+        choices=("fast", "native"),
+        default=None,
+        help="Extraction engine override ('fast' O(N) prefix sweep or 'native' ocpa)",
+    )
+    parser.add_argument(
+        "--verify-equivalence",
+        action="store_true",
+        help="Run both native and fast extractors and assert exact numerical equivalence",
+    )
     args = parser.parse_args()
     configure_logging()
-    run_feature_extraction(config_path=args.config, debug_override=args.debug)
+    run_feature_extraction(
+        config_path=args.config,
+        debug_override=args.debug,
+        extraction_mode=args.mode,
+        verify_equivalence=args.verify_equivalence,
+    )
 
 
 if __name__ == "__main__":

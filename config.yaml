@@ -62,6 +62,8 @@ ocpa:
   event_value_attribute: null
   # Optional event start timestamp column for P9 (Service Time) and P10 (Waiting Time).
   start_timestamp_column: null
+  # Feature extraction engine: "fast" (O(N) prefix-sweep equivalent) or "native" (ocpa pm_factory.apply)
+  extraction_mode: "fast"
   workers: 1
 
 features:

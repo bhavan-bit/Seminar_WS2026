@@ -31,6 +31,7 @@ from src.feature_extraction import (
     build_ocel_from_dataframe,
     extract_feature_storage,
     validate_feature_storage,
+    verify_native_vs_fast_equivalence,
 )
 
 
@@ -219,6 +220,73 @@ def test_missing_values_preserved_without_global_imputation(
     assert np.isnan(ev1_node.attributes["D3_current_event_attr"])
     assert np.isfinite(ev1_node.attributes["y_true"])
     assert ev1_node.attributes["y_true"] >= 0.0
+
+
+def test_fast_vs_native_exact_equivalence(base_config: dict[str, Any]) -> None:
+    """Verify fast O(N) prefix-sweep extraction matches native ocpa cell-for-cell (including tied timestamps & NaNs)."""
+    cfg = copy.deepcopy(base_config)
+    cfg["debug_mode"] = False
+    cfg["target"]["unit"] = "minutes"
+
+    # Test on standard minimal fixture
+    ocel = _make_minimal_ocel_fixture()
+    stats = verify_native_vs_fast_equivalence(ocel, cfg, rtol=1e-12, atol=1e-12)
+    assert stats["total_values_checked"] > 0
+    assert stats["max_abs_diff"] < 1e-12
+
+    # Also test specifically with tied/simultaneous timestamps (common in real OCEL logs)
+    t0 = datetime(2025, 1, 1, 8, 0, 0)
+    tied_rows = [
+        {
+            "event_id": 0,
+            "event_activity": "init",
+            "event_timestamp": t0,
+            "event_start_timestamp": t0,
+            "order": ["o1"],
+            "item": ["i1"],
+            "event_amount": 10.0,
+        },
+        {
+            "event_id": 1,
+            "event_activity": "init",
+            "event_timestamp": t0,  # tied timestamp with event 0
+            "event_start_timestamp": t0,
+            "order": ["o1"],
+            "item": ["i2"],
+            "event_amount": np.nan,
+        },
+        {
+            "event_id": 2,
+            "event_activity": "process",
+            "event_timestamp": t0 + timedelta(minutes=5),
+            "event_start_timestamp": t0 + timedelta(minutes=3),
+            "order": ["o1"],
+            "item": ["i1", "i2"],
+            "event_amount": 30.0,
+        },
+        {
+            "event_id": 3,
+            "event_activity": "finish",
+            "event_timestamp": t0 + timedelta(minutes=5),  # tied end timestamp
+            "event_start_timestamp": t0 + timedelta(minutes=4),
+            "order": ["o1"],
+            "item": ["i1"],
+            "event_amount": 20.0,
+        },
+    ]
+    tied_ocel = build_ocel_from_dataframe(
+        pd.DataFrame(tied_rows),
+        {
+            "obj_names": ["order", "item"],
+            "val_names": ["event_amount"],
+            "act_name": "event_activity",
+            "time_name": "event_timestamp",
+            "sep": ",",
+        },
+    )
+    tied_stats = verify_native_vs_fast_equivalence(tied_ocel, cfg, rtol=1e-12, atol=1e-12)
+    assert tied_stats["total_values_checked"] > 0
+    assert tied_stats["max_abs_diff"] < 1e-12
 
 
 def test_debug_mode_caps_cases_and_events(base_config: dict[str, Any]) -> None:
