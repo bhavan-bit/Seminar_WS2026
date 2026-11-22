@@ -15,7 +15,7 @@ from typing import Any
 import numpy as np
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Dataset, TensorDataset
 
 from src import set_global_seed
 from src.models.base import BaseOCPMModel
@@ -80,31 +80,40 @@ class SequenceLSTMModel(BaseOCPMModel):
 
     def fit(
         self,
-        X_train: np.ndarray,
+        X_train: np.ndarray | Dataset,
         y_train: np.ndarray | None = None,
-        X_val: np.ndarray | None = None,
+        X_val: np.ndarray | Dataset | None = None,
         y_val: np.ndarray | None = None,
         **kwargs: Any,
     ) -> SequenceLSTMModel:
         """Train the prefix LSTM on Sub-Train sequences with early stopping on Sub-Val.
 
         Args:
-            X_train: 3D float array of shape ``(N_train, W, F)`` from ``encode_sequential``.
-            y_train: 1D target array of shape ``(N_train,)``.
-            X_val: Optional 3D validation array ``(N_val, W, F)``.
-            y_val: Optional 1D validation target array ``(N_val,)``.
+            X_train: Either a 3D float array ``(N_train, W, F)`` or a lazy
+                PyTorch ``Dataset`` yielding ``(window, target)`` pairs.
+            y_train: 1D target array of shape ``(N_train,)`` (required when
+                ``X_train`` is a NumPy array).
+            X_val: Optional 3D validation array or lazy validation ``Dataset``.
+            y_val: Optional 1D validation target array.
             **kwargs: Unused extra arguments for interface compatibility.
 
         Returns:
             Fitted ``SequenceLSTMModel`` restored to best validation checkpoint.
         """
-        if y_train is None:
-            raise ValueError("SequenceLSTMModel.fit requires y_train.")
         set_global_seed(self.random_seed)
 
-        x_tr_t = torch.from_numpy(np.asarray(X_train, dtype=np.float32))
-        y_tr_t = torch.from_numpy(np.asarray(y_train, dtype=np.float32))
-        train_ds = TensorDataset(x_tr_t, y_tr_t)
+        if isinstance(X_train, Dataset):
+            train_ds: Dataset = X_train
+            sample_x = train_ds[0][0]
+            input_dim = int(sample_x.shape[-1])
+        else:
+            if y_train is None:
+                raise ValueError("SequenceLSTMModel.fit requires y_train when X_train is an array.")
+            x_tr_t = torch.from_numpy(np.asarray(X_train, dtype=np.float32))
+            y_tr_t = torch.from_numpy(np.asarray(y_train, dtype=np.float32))
+            train_ds = TensorDataset(x_tr_t, y_tr_t)
+            input_dim = int(x_tr_t.shape[-1])
+
         generator = torch.Generator().manual_seed(self.random_seed)
         train_loader = DataLoader(
             train_ds,
@@ -114,16 +123,18 @@ class SequenceLSTMModel(BaseOCPMModel):
         )
 
         val_loader: DataLoader | None = None
-        if X_val is not None and y_val is not None and len(X_val) > 0:
-            x_va_t = torch.from_numpy(np.asarray(X_val, dtype=np.float32))
-            y_va_t = torch.from_numpy(np.asarray(y_val, dtype=np.float32))
-            val_loader = DataLoader(
-                TensorDataset(x_va_t, y_va_t),
-                batch_size=self.batch_size,
-                shuffle=False,
-            )
+        if X_val is not None:
+            if isinstance(X_val, Dataset) and len(X_val) > 0:
+                val_loader = DataLoader(X_val, batch_size=self.batch_size, shuffle=False)
+            elif not isinstance(X_val, Dataset) and y_val is not None and len(X_val) > 0:
+                x_va_t = torch.from_numpy(np.asarray(X_val, dtype=np.float32))
+                y_va_t = torch.from_numpy(np.asarray(y_val, dtype=np.float32))
+                val_loader = DataLoader(
+                    TensorDataset(x_va_t, y_va_t),
+                    batch_size=self.batch_size,
+                    shuffle=False,
+                )
 
-        input_dim = int(x_tr_t.shape[-1])
         self._net = _PrefixLSTMNet(
             input_dim=input_dim,
             hidden_dim=self.hidden_dim,
@@ -199,11 +210,11 @@ class SequenceLSTMModel(BaseOCPMModel):
             self._net.load_state_dict(best_state)
         return self
 
-    def predict(self, X: np.ndarray, **kwargs: Any) -> np.ndarray:
-        """Predict event-level remaining times for 3D prefix sequences ``X``.
+    def predict(self, X: np.ndarray | Dataset, **kwargs: Any) -> np.ndarray:
+        """Predict event-level remaining times for 3D prefix sequences or lazy ``Dataset``.
 
         Args:
-            X: 3D float array of shape ``(N, W, F)`` from ``encode_sequential``.
+            X: 3D float array ``(N, W, F)`` or lazy ``Dataset`` yielding ``(window,)``.
             **kwargs: Unused extra arguments for interface compatibility.
 
         Returns:
@@ -212,14 +223,17 @@ class SequenceLSTMModel(BaseOCPMModel):
         if self._net is None:
             raise RuntimeError("SequenceLSTMModel must be fitted before calling predict().")
 
-        x_t = torch.from_numpy(np.asarray(X, dtype=np.float32))
-        loader = DataLoader(TensorDataset(x_t), batch_size=self.batch_size, shuffle=False)
+        if isinstance(X, Dataset):
+            loader = DataLoader(X, batch_size=self.batch_size, shuffle=False)
+        else:
+            x_t = torch.from_numpy(np.asarray(X, dtype=np.float32))
+            loader = DataLoader(TensorDataset(x_t), batch_size=self.batch_size, shuffle=False)
 
         self._net.eval()
         chunks: list[np.ndarray] = []
         with torch.no_grad():
-            for (batch_x,) in loader:
-                batch_x = batch_x.to(self.device)
+            for batch in loader:
+                batch_x = batch[0].to(self.device)
                 chunks.append(self._net(batch_x).cpu().numpy())
 
         if not chunks:

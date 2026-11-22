@@ -17,6 +17,7 @@ Strict Isolation Invariant:
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import logging
 import pickle
@@ -26,22 +27,22 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+import torch
 from ocpa.algo.predictive_monitoring.obj import Feature_Storage
 from sklearn.model_selection import KFold, ShuffleSplit
 
-from src import configure_logging, load_config, set_global_seed
+from src import configure_logging, load_config, resolve_tier_columns, set_global_seed
 from src.feature_selection import run_shap_rfe
 from src.models.graph_gnn import GraphGNNModel
 from src.models.seq_lstm import SequenceLSTMModel
 from src.models.tabular_xgb import TabularXGBModel
 from src.ocpa_encoding import (
-    OcpaFeatureScaler,
-    encode_pyg_graphs,
-    encode_sequential,
-    encode_tabular,
+    CausalPrefixSequenceDataset,
+    CompactFoldScaler,
+    CompactOcpaDataset,
+    build_pyg_graphs_from_compact,
     filter_feature_keys_for_tier,
-    get_case_ids,
-    slice_feature_storage,
+    unpack_feature_storage_compact,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -429,26 +430,30 @@ def _export_stage2_diagnostics(
 
 
 def run_cross_validation_in_memory(
-    feature_storage: Feature_Storage,
+    feature_storage: Feature_Storage | CompactOcpaDataset,
     config: dict[str, Any],
     diagnostics_out_dir: str | Path | None = None,
+    consume_storage: bool = False,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Run leak-free 5-fold cross-validation across all 9 model-tier combinations.
 
+    Accepts either an unnormalized ``ocpa`` ``Feature_Storage`` or a pre-unpacked
+    unnormalized ``CompactOcpaDataset`` (avoiding multi-GB Python dict overhead on
+    memory-constrained hosts) and performs all fold-scoped scaling, nested
+    SHAP-RFE, and model training strictly within each fold's training splits.
+
     Args:
-        feature_storage: Unnormalized Stage 1a ``ocpa`` ``Feature_Storage``.
+        feature_storage: Unnormalized Stage 1a ``Feature_Storage`` or ``CompactOcpaDataset``.
         config: Loaded configuration dictionary.
+        diagnostics_out_dir: Optional directory for intermediate CSV/SHAP diagnostics.
+        consume_storage: If ``True``, releases ``Feature_Storage`` node dicts after
+            compact unpacking to keep peak RAM low.
 
     Returns:
         Tuple of ``(oof_predictions_df, selected_features_per_fold)``.
     """
     seed = int(config["random_seed"])
     set_global_seed(seed)
-
-    if feature_storage.scaler is not None:
-        raise ValueError(
-            "Input Feature_Storage appears pre-normalized. Stage 2 requires raw unnormalized Feature_Storage."
-        )
 
     case_col = config["identifiers"]["case_id"]
     event_col = config["identifiers"]["event_id"]
@@ -457,22 +462,41 @@ def run_cross_validation_in_memory(
     inner_test_size = float(config["cv"]["inner_test_size"])
     window_size = int(config.get("models", {}).get("lstm", {}).get("window_size", 20))
 
+    if isinstance(feature_storage, CompactOcpaDataset):
+        compact = feature_storage
+        available_keys = list(compact.feature_keys)
+    else:
+        if feature_storage.scaler is not None:
+            raise ValueError(
+                "Input Feature_Storage appears pre-normalized. Stage 2 requires raw unnormalized Feature_Storage."
+            )
+        available_keys = list(feature_storage.event_features)
+        compact = unpack_feature_storage_compact(
+            feature_storage=feature_storage,
+            target_key=target_col,
+            consume_storage=consume_storage,
+        )
+
     tier_keys: dict[str, list[str]] = {
-        "T1": filter_feature_keys_for_tier(feature_storage, config, "tier_1"),
-        "T2": filter_feature_keys_for_tier(feature_storage, config, "tier_2"),
-        "T3": filter_feature_keys_for_tier(feature_storage, config, "tier_3"),
+        "T1": resolve_tier_columns(available_keys, config, "tier_1"),
+        "T2": resolve_tier_columns(available_keys, config, "tier_2"),
+        "T3": resolve_tier_columns(available_keys, config, "tier_3"),
     }
     for label, keys in tier_keys.items():
         if not keys:
             raise ValueError(f"Resolved zero feature keys for {label}.")
         LOGGER.info("Tier %s feature key count: %d", label, len(keys))
 
-    num_graphs = len(feature_storage.feature_graphs)
-    total_input_events = sum(len(g.nodes) for g in feature_storage.feature_graphs)
+    LOGGER.info(
+        "Loaded compact float32 matrix: shape=%s (%.1f MB RAM).",
+        compact.X_raw.shape,
+        compact.X_raw.nbytes / (1024 * 1024),
+    )
 
-    raw_cv_groups = [
-        g.attributes.get("cv_group_id") for g in feature_storage.feature_graphs
-    ]
+    num_graphs = len(compact.case_ids_per_graph)
+    total_input_events = int(compact.X_raw.shape[0])
+
+    raw_cv_groups = compact.cv_groups_per_graph
     cv_groups = raw_cv_groups if all(v is not None for v in raw_cv_groups) else None
     if cv_groups is not None:
         LOGGER.info(
@@ -498,18 +522,29 @@ def run_cross_validation_in_memory(
 
     for fold in folds:
         fold_id = int(fold["fold_id"])
-        train_fs_raw = slice_feature_storage(feature_storage, fold["train_idx"])
-        test_fs_raw = slice_feature_storage(feature_storage, fold["test_idx"])
-        sub_train_fs_raw = slice_feature_storage(feature_storage, fold["sub_train_idx"])
-        sub_val_fs_raw = slice_feature_storage(feature_storage, fold["sub_val_idx"])
+        train_idx = fold["train_idx"].tolist()
+        test_idx = fold["test_idx"].tolist()
+        sub_train_idx = fold["sub_train_idx"].tolist()
+        sub_val_idx = fold["sub_val_idx"].tolist()
 
-        _assert_disjoint_cases(train_fs_raw, test_fs_raw, "Train", "Test")
-        _assert_disjoint_cases(sub_train_fs_raw, sub_val_fs_raw, "Sub-Train", "Sub-Val")
+        train_cases = sorted(compact.case_ids_per_graph[i] for i in train_idx)
+        test_cases = sorted(compact.case_ids_per_graph[i] for i in test_idx)
+        sub_train_cases = sorted(compact.case_ids_per_graph[i] for i in sub_train_idx)
+        sub_val_cases = sorted(compact.case_ids_per_graph[i] for i in sub_val_idx)
+
+        if set(train_cases) & set(test_cases):
+            raise AssertionError(
+                f"Intra-case leakage between Train and Test: {set(train_cases) & set(test_cases)}"
+            )
+        if set(sub_train_cases) & set(sub_val_cases):
+            raise AssertionError(
+                f"Intra-case leakage between Sub-Train and Sub-Val: {set(sub_train_cases) & set(sub_val_cases)}"
+            )
         if cv_groups is not None:
-            tr_grp_set = {g.attributes.get("cv_group_id") for g in train_fs_raw.feature_graphs}
-            te_grp_set = {g.attributes.get("cv_group_id") for g in test_fs_raw.feature_graphs}
-            sub_tr_grp_set = {g.attributes.get("cv_group_id") for g in sub_train_fs_raw.feature_graphs}
-            sub_va_grp_set = {g.attributes.get("cv_group_id") for g in sub_val_fs_raw.feature_graphs}
+            tr_grp_set = {cv_groups[i] for i in train_idx}
+            te_grp_set = {cv_groups[i] for i in test_idx}
+            sub_tr_grp_set = {cv_groups[i] for i in sub_train_idx}
+            sub_va_grp_set = {cv_groups[i] for i in sub_val_idx}
             if tr_grp_set & te_grp_set:
                 raise AssertionError(f"Parent CV group leakage between Train and Test: {tr_grp_set & te_grp_set}")
             if sub_tr_grp_set & sub_va_grp_set:
@@ -521,37 +556,28 @@ def run_cross_validation_in_memory(
             "=== Fold %d/%d | Train=%d cases | Sub-Train=%d cases | Sub-Val=%d cases | Test=%d cases ===",
             fold_id + 1,
             n_splits,
-            len(train_fs_raw.feature_graphs),
-            len(sub_train_fs_raw.feature_graphs),
-            len(sub_val_fs_raw.feature_graphs),
-            len(test_fs_raw.feature_graphs),
+            len(train_cases),
+            len(sub_train_cases),
+            len(sub_val_cases),
+            len(test_cases),
         )
 
         # ------------------------------------------------------------------
         # Step 1: Inner-fold scaling (fit strictly on 12 Sub-Train graphs)
         # ------------------------------------------------------------------
-        inner_scaler = OcpaFeatureScaler(target_key=target_col)
-        sub_train_fs_scaled = inner_scaler.fit_transform(sub_train_fs_raw)
-        sub_val_fs_scaled = inner_scaler.transform(sub_val_fs_raw)
-        test_fs_inner_scaled = inner_scaler.transform(test_fs_raw)
+        inner_scaler = CompactFoldScaler().fit(compact, sub_train_idx)
 
         # ------------------------------------------------------------------
         # Step 2: Nested Tier 3 SHAP-RFE strictly on (Sub-Train, Sub-Val)
         # ------------------------------------------------------------------
-        X_sub_tr_t3, y_sub_tr_t3, _ = encode_tabular(
-            sub_train_fs_scaled,
-            feature_keys=tier_keys["T3"],
-            target_key=target_col,
-            case_col=case_col,
-            event_col=event_col,
+        X_sub_tr_arr, y_sub_tr_t3, _, _, _ = inner_scaler.transform_split(
+            compact, sub_train_idx, tier_keys["T3"], case_col=case_col, event_col=event_col
         )
-        X_sub_va_t3, y_sub_va_t3, meta_sub_va_t3 = encode_tabular(
-            sub_val_fs_scaled,
-            feature_keys=tier_keys["T3"],
-            target_key=target_col,
-            case_col=case_col,
-            event_col=event_col,
+        X_sub_va_arr, y_sub_va_t3, meta_sub_va_t3, _, _ = inner_scaler.transform_split(
+            compact, sub_val_idx, tier_keys["T3"], case_col=case_col, event_col=event_col
         )
+        X_sub_tr_t3 = pd.DataFrame(X_sub_tr_arr, columns=tier_keys["T3"])
+        X_sub_va_t3 = pd.DataFrame(X_sub_va_arr, columns=tier_keys["T3"])
 
         t_rfe_start = time.perf_counter()
         rfe_result = run_shap_rfe(
@@ -564,6 +590,7 @@ def run_cross_validation_in_memory(
         )
         fold_shap_rfe_sec = time.perf_counter() - t_rfe_start
         t3_selected_keys = rfe_result.best_features
+
         if rfe_result.best_val_shap_values is not None:
             val_shap_df = pd.concat(
                 [
@@ -574,47 +601,33 @@ def run_cross_validation_in_memory(
                 axis=1,
             )
             val_shap_frames[fold_id] = val_shap_df
+
         selected_features_log[f"fold_{fold_id}"] = {
-            "train_cases": get_case_ids(train_fs_raw),
-            "sub_train_cases": get_case_ids(sub_train_fs_raw),
-            "sub_val_cases": get_case_ids(sub_val_fs_raw),
-            "test_cases": get_case_ids(test_fs_raw),
+            "train_cases": train_cases,
+            "sub_train_cases": sub_train_cases,
+            "sub_val_cases": sub_val_cases,
+            "test_cases": test_cases,
             "shap_rfe_seconds": round(fold_shap_rfe_sec, 4),
             **(
                 {
-                    "train_cv_groups": sorted(
-                        {str(g.attributes.get("cv_group_id")) for g in train_fs_raw.feature_graphs}
-                    ),
-                    "sub_train_cv_groups": sorted(
-                        {str(g.attributes.get("cv_group_id")) for g in sub_train_fs_raw.feature_graphs}
-                    ),
-                    "sub_val_cv_groups": sorted(
-                        {str(g.attributes.get("cv_group_id")) for g in sub_val_fs_raw.feature_graphs}
-                    ),
-                    "test_cv_groups": sorted(
-                        {str(g.attributes.get("cv_group_id")) for g in test_fs_raw.feature_graphs}
-                    ),
+                    "train_cv_groups": sorted({str(cv_groups[i]) for i in train_idx}),
+                    "sub_train_cv_groups": sorted({str(cv_groups[i]) for i in sub_train_idx}),
+                    "sub_val_cv_groups": sorted({str(cv_groups[i]) for i in sub_val_idx}),
+                    "test_cv_groups": sorted({str(cv_groups[i]) for i in test_idx}),
                 }
                 if cv_groups is not None
                 else {}
             ),
             **rfe_result.to_log_dict(),
         }
+        del X_sub_tr_arr, X_sub_va_arr, X_sub_tr_t3, X_sub_va_t3
+        gc.collect()
 
         # ------------------------------------------------------------------
-        # Step 3: Outer-fold scaling (fit strictly on 16 Train graphs) for XGBoost
+        # Step 3: Canonical holdout test metadata & targets
         # ------------------------------------------------------------------
-        outer_scaler = OcpaFeatureScaler(target_key=target_col)
-        train_fs_outer_scaled = outer_scaler.fit_transform(train_fs_raw)
-        test_fs_outer_scaled = outer_scaler.transform(test_fs_raw)
-
-        # Canonical holdout test metadata & targets
-        _, y_test_base, base_test_meta = encode_tabular(
-            test_fs_outer_scaled,
-            feature_keys=tier_keys["T1"],
-            target_key=target_col,
-            case_col=case_col,
-            event_col=event_col,
+        _, y_test_base, base_test_meta, _, _ = inner_scaler.transform_split(
+            compact, test_idx, tier_keys["T1"][:1], case_col=case_col, event_col=event_col
         )
         fold_preds: dict[str, Any] = {
             case_col: base_test_meta[case_col].to_numpy(),
@@ -623,37 +636,34 @@ def run_cross_validation_in_memory(
             target_col: y_test_base,
         }
 
-        # ------------------------------------------------------------------
-        # Step 4: Train & evaluate XGBoost, LSTM, and GNN across Tiers 1–3
-        # ------------------------------------------------------------------
         active_tier_map = {
             "T1": tier_keys["T1"],
             "T2": tier_keys["T2"],
             "T3": t3_selected_keys,
         }
-
         tier_display = {"T1": "Tier 1", "T2": "Tier 2", "T3": "Tier 3"}
+
+        # Outer-fold scaler (fit strictly on all 16 Train graphs) for XGBoost
+        outer_scaler = CompactFoldScaler().fit(compact, train_idx)
+
+        # ------------------------------------------------------------------
+        # Step 4: Train & evaluate XGBoost, LSTM (lazy Dataset), and GNN
+        # ------------------------------------------------------------------
         for tier_idx, (tier_code, active_keys) in enumerate(active_tier_map.items()):
             tier_seed = seed + fold_id * 100 + tier_idx * 10
             tier_label = tier_display[tier_code]
             shap_sec = fold_shap_rfe_sec if tier_code == "T3" else 0.0
 
-            # 1. XGBoost (ocpa tabular encoding on 16 outer Train graphs)
+            # 1. XGBoost (outer 16 Train graphs)
             t0 = time.perf_counter()
-            X_tr_tab, y_tr_tab, _ = encode_tabular(
-                train_fs_outer_scaled,
-                feature_keys=active_keys,
-                target_key=target_col,
-                case_col=case_col,
-                event_col=event_col,
+            X_tr_arr, y_tr_tab, _, _, _ = outer_scaler.transform_split(
+                compact, train_idx, active_keys, case_col=case_col, event_col=event_col
             )
-            X_te_tab, _, te_tab_meta = encode_tabular(
-                test_fs_outer_scaled,
-                feature_keys=active_keys,
-                target_key=target_col,
-                case_col=case_col,
-                event_col=event_col,
+            X_te_arr, _, te_tab_meta, _, _ = outer_scaler.transform_split(
+                compact, test_idx, active_keys, case_col=case_col, event_col=event_col
             )
+            X_tr_tab = pd.DataFrame(X_tr_arr, columns=active_keys)
+            X_te_tab = pd.DataFrame(X_te_arr, columns=active_keys)
             t_enc = time.perf_counter() - t0
 
             xgb_model = TabularXGBModel(config=config, random_seed=tier_seed)
@@ -682,43 +692,31 @@ def run_cross_validation_in_memory(
                     "SHAP_RFE_Seconds": shap_sec,
                 }
             )
+            del X_tr_arr, X_te_arr, X_tr_tab, X_te_tab, xgb_model
 
-            # 2. LSTM (ocpa sequential encoding on 12 Sub-Train / 4 Sub-Val graphs)
+            # Inner-scaled compact split shared by LSTM and GNN for this tier
             t0 = time.perf_counter()
-            X_sub_tr_seq, y_sub_tr_seq, _ = encode_sequential(
-                sub_train_fs_scaled,
-                feature_keys=active_keys,
-                target_key=target_col,
-                window_size=window_size,
-                case_col=case_col,
-                event_col=event_col,
+            X_st, y_st, _, st_slices, st_edges = inner_scaler.transform_split(
+                compact, sub_train_idx, active_keys, case_col=case_col, event_col=event_col
             )
-            X_sub_va_seq, y_sub_va_seq, _ = encode_sequential(
-                sub_val_fs_scaled,
-                feature_keys=active_keys,
-                target_key=target_col,
-                window_size=window_size,
-                case_col=case_col,
-                event_col=event_col,
+            X_sv, y_sv, _, sv_slices, sv_edges = inner_scaler.transform_split(
+                compact, sub_val_idx, active_keys, case_col=case_col, event_col=event_col
             )
-            X_te_seq, _, te_seq_meta = encode_sequential(
-                test_fs_inner_scaled,
-                feature_keys=active_keys,
-                target_key=target_col,
-                window_size=window_size,
-                case_col=case_col,
-                event_col=event_col,
+            X_te_in, y_te_in, te_in_meta, te_slices, te_edges = inner_scaler.transform_split(
+                compact, test_idx, active_keys, case_col=case_col, event_col=event_col
             )
-            t_enc = time.perf_counter() - t0
+            t_inner_scale = time.perf_counter() - t0
+
+            # 2. LSTM (memory-safe lazy causal prefix Dataset; zero 3D tensor bloat)
+            t0 = time.perf_counter()
+            ds_tr = CausalPrefixSequenceDataset(X_st, st_slices, window_size=window_size, y=y_st)
+            ds_va = CausalPrefixSequenceDataset(X_sv, sv_slices, window_size=window_size, y=y_sv)
+            ds_te = CausalPrefixSequenceDataset(X_te_in, te_slices, window_size=window_size, y=None)
+            t_enc_lstm = t_inner_scale + (time.perf_counter() - t0)
 
             lstm_model = SequenceLSTMModel(config=config, random_seed=tier_seed)
             t0 = time.perf_counter()
-            lstm_model.fit(
-                X_sub_tr_seq,
-                y_sub_tr_seq,
-                X_val=X_sub_va_seq,
-                y_val=y_sub_va_seq,
-            )
+            lstm_model.fit(ds_tr, X_val=ds_va)
             t_train = time.perf_counter() - t0
             for h_row in lstm_model.training_history:
                 training_history_rows.append(
@@ -726,11 +724,11 @@ def run_cross_validation_in_memory(
                 )
 
             t0 = time.perf_counter()
-            lstm_preds = lstm_model.predict(X_te_seq)
+            lstm_preds = lstm_model.predict(ds_te)
             t_pred = time.perf_counter() - t0
 
             fold_preds[f"Pred_LSTM_{tier_code}"] = _align_predictions_to_base(
-                base_test_meta, te_seq_meta, lstm_preds, case_col, event_col
+                base_test_meta, te_in_meta, lstm_preds, case_col, event_col
             )
             runtime_rows.append(
                 {
@@ -739,38 +737,21 @@ def run_cross_validation_in_memory(
                     "Model": "LSTM",
                     "Num_Features": len(active_keys),
                     "Epochs_Run": len(lstm_model.training_history),
-                    "Encode_Seconds": t_enc,
+                    "Encode_Seconds": t_enc_lstm,
                     "Train_Seconds": t_train,
                     "Predict_Seconds": t_pred,
-                    "Total_Seconds": t_enc + t_train + t_pred,
+                    "Total_Seconds": t_enc_lstm + t_train + t_pred,
                     "SHAP_RFE_Seconds": shap_sec,
                 }
             )
+            del ds_tr, ds_va, ds_te, lstm_model
 
-            # 3. GNN (PyG graph encoding on 12 Sub-Train / 4 Sub-Val graphs)
+            # 3. GNN (PyG causal Data graphs)
             t0 = time.perf_counter()
-            tr_pyg, _ = encode_pyg_graphs(
-                sub_train_fs_scaled,
-                feature_keys=active_keys,
-                target_key=target_col,
-                case_col=case_col,
-                event_col=event_col,
-            )
-            va_pyg, _ = encode_pyg_graphs(
-                sub_val_fs_scaled,
-                feature_keys=active_keys,
-                target_key=target_col,
-                case_col=case_col,
-                event_col=event_col,
-            )
-            te_pyg, te_pyg_meta = encode_pyg_graphs(
-                test_fs_inner_scaled,
-                feature_keys=active_keys,
-                target_key=target_col,
-                case_col=case_col,
-                event_col=event_col,
-            )
-            t_enc = time.perf_counter() - t0
+            tr_pyg = build_pyg_graphs_from_compact(X_st, y_st, st_slices, st_edges)
+            va_pyg = build_pyg_graphs_from_compact(X_sv, y_sv, sv_slices, sv_edges)
+            te_pyg = build_pyg_graphs_from_compact(X_te_in, y_te_in, te_slices, te_edges)
+            t_enc_gnn = t_inner_scale + (time.perf_counter() - t0)
 
             gnn_model = GraphGNNModel(config=config, random_seed=tier_seed)
             t0 = time.perf_counter()
@@ -786,7 +767,7 @@ def run_cross_validation_in_memory(
             t_pred = time.perf_counter() - t0
 
             fold_preds[f"Pred_GNN_{tier_code}"] = _align_predictions_to_base(
-                base_test_meta, te_pyg_meta, gnn_preds, case_col, event_col
+                base_test_meta, te_in_meta, gnn_preds, case_col, event_col
             )
             runtime_rows.append(
                 {
@@ -795,13 +776,15 @@ def run_cross_validation_in_memory(
                     "Model": "GNN",
                     "Num_Features": len(active_keys),
                     "Epochs_Run": len(gnn_model.training_history),
-                    "Encode_Seconds": t_enc,
+                    "Encode_Seconds": t_enc_gnn,
                     "Train_Seconds": t_train,
                     "Predict_Seconds": t_pred,
-                    "Total_Seconds": t_enc + t_train + t_pred,
+                    "Total_Seconds": t_enc_gnn + t_train + t_pred,
                     "SHAP_RFE_Seconds": shap_sec,
                 }
             )
+            del X_st, X_sv, X_te_in, tr_pyg, va_pyg, te_pyg, gnn_model
+            gc.collect()
 
         oof_frames.append(pd.DataFrame(fold_preds))
 
@@ -859,18 +842,28 @@ def run_cross_validation(
     sel_out = Path(config["paths"]["selected_features_per_fold"])
     diag_dir = Path(config["paths"].get("diagnostics_dir", "data/results/diagnostics"))
 
-    if not fs_path.exists():
-        raise FileNotFoundError(
-            f"Feature_Storage not found at {fs_path}. Run Stage 1a first."
+    compact_path = fs_path.with_name("feature_storage_compact.pt")
+    use_compact_cache = compact_path.exists() and (
+        not fs_path.exists() or compact_path.stat().st_mtime >= fs_path.stat().st_mtime
+    )
+    if use_compact_cache:
+        LOGGER.info("Loading compact Stage 1a cache from %s (low-RAM mode).", compact_path)
+        stage1_input: Feature_Storage | CompactOcpaDataset = torch.load(
+            compact_path, weights_only=False
         )
-
-    with fs_path.open("rb") as handle:
-        feature_storage: Feature_Storage = pickle.load(handle)
+    else:
+        if not fs_path.exists():
+            raise FileNotFoundError(
+                f"Feature_Storage not found at {fs_path}. Run Stage 1a first."
+            )
+        with fs_path.open("rb") as handle:
+            stage1_input = pickle.load(handle)
 
     oof_df, selected_features_log = run_cross_validation_in_memory(
-        feature_storage=feature_storage,
+        feature_storage=stage1_input,
         config=config,
         diagnostics_out_dir=diag_dir,
+        consume_storage=True,
     )
 
     preds_out.parent.mkdir(parents=True, exist_ok=True)

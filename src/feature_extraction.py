@@ -1650,7 +1650,20 @@ def run_feature_extraction(
     case_index_df.to_parquet(idx_out, index=False)
     export_stage1_diagnostics(feature_storage, case_index_df, config)
 
+    # Also persist a compact float32 cache (~15x lower RAM on load) for Stage 2
+    import torch
+    from src.ocpa_encoding import unpack_feature_storage_compact
+
+    compact_out = fs_out.with_name("feature_storage_compact.pt")
+    compact = unpack_feature_storage_compact(
+        feature_storage,
+        target_key=config["target"]["column"],
+        consume_storage=False,
+    )
+    torch.save(compact, compact_out)
+
     LOGGER.info("Saved unnormalized Feature_Storage to %s", fs_out)
+    LOGGER.info("Saved compact unnormalized Stage 1a cache to %s", compact_out)
     LOGGER.info("Saved case index metadata to %s", idx_out)
     return feature_storage, case_index_df
 

@@ -128,5 +128,11 @@ Replace the 4 modular placeholder functions (`compute_metric_1`–`compute_metri
 pytest -v
 ```
 
-All tests verify Stage 1 `Feature_Storage` schema/alignment, fold-scoped normalization without leakage, validation-only SHAP-RFE stopping behavior, Stage 2 isolation from entanglement metrics, and Stage 3 evaluation matrix computation.
+All tests verify Stage 1 `Feature_Storage` schema/alignment, exact parity between fast and native `ocpa` extraction (`--verify-equivalence`), fold-scoped normalization without leakage, validation-only SHAP-RFE stopping behavior, Stage 2 isolation from entanglement metrics, and Stage 3 evaluation matrix computation.
+
+---
+
+## Engineering & Optimization Transparency
+
+All data-structure and runtime optimizations (including the verified $O(N)$ prefix-sweep extractor, low-RAM compact array packing, lazy LSTM prefix dataset, and exact equivalence checks) are documented in [docs/OPTIMIZATIONS_AND_EQUIVALENCE.md](docs/OPTIMIZATIONS_AND_EQUIVALENCE.md).
 

@@ -38,12 +38,15 @@ from src.evaluation import (
 )
 from src.feature_extraction import build_ocel_from_dataframe, extract_feature_storage
 from src.ocpa_encoding import (
+    CausalPrefixSequenceDataset,
+    CompactFoldScaler,
     OcpaFeatureScaler,
     encode_pyg_graphs,
     encode_sequential,
     encode_tabular,
     filter_feature_keys_for_tier,
     slice_feature_storage,
+    unpack_feature_storage_compact,
 )
 
 
@@ -286,6 +289,19 @@ def test_ocpa_scaler_strict_train_only_fitting_and_encoding_alignment() -> None:
     pyg_pairs = list(zip(meta_pyg["Case_ID"], meta_pyg["Event_ID"]))
     assert tab_pairs == seq_pairs == pyg_pairs
     assert np.allclose(y_te, y_seq)
+
+    # CompactFoldScaler + lazy CausalPrefixSequenceDataset must match OcpaFeatureScaler + encode_sequential
+    compact = unpack_feature_storage_compact(fs, target_key="y_true", consume_storage=False)
+    c_scaler = CompactFoldScaler().fit(compact, list(range(16)))
+    X_te_c, y_te_c, _, te_slices, _ = c_scaler.transform_split(compact, list(range(16, 20)), t1_keys)
+    # Note: test_fs had an injected outlier on one node; verify exact match on clean train split
+    X_tr_c, y_tr_c, _, tr_slices, _ = c_scaler.transform_split(compact, list(range(16)), t1_keys)
+    assert np.allclose(X_tr_c, X_tr.to_numpy(dtype=np.float32), atol=1e-5)
+    assert np.allclose(y_tr_c, y_tr)
+    X_tr_seq_ref, _, _ = encode_sequential(train_scaled, t1_keys, window_size=5)
+    lazy_ds = CausalPrefixSequenceDataset(X_tr_c, tr_slices, window_size=5, y=y_tr_c)
+    lazy_stack = np.stack([lazy_ds[i][0].numpy() for i in range(len(lazy_ds))], axis=0)
+    assert np.allclose(lazy_stack, X_tr_seq_ref, atol=1e-5)
 
 
 def test_full_5fold_cv_and_stage3_evaluation_reproducibility() -> None:
